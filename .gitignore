@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+*.sqlite3
+*.db
+
+dist/*.tar.gz
+dist/videoshare-bot-raspi/
+
+/downloads/
+/tmp/

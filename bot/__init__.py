@@ -1,0 +1,1 @@
+"""VideoShare Telegram bot."""

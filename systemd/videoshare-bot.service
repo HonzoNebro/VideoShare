@@ -1,0 +1,21 @@
+[Unit]
+Description=VideoShare Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/videoshare-bot
+EnvironmentFile=/opt/videoshare-bot/.env
+Environment=PATH=/opt/videoshare-bot/.venv/bin:/home/pi/.deno/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/videoshare-bot/.venv/bin/python -m bot.main
+Restart=on-failure
+RestartSec=10
+
+# Keep temporary files local to the service user.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+En la Raspberry, si el proyecto está en /opt/videoshare-bot:
+
+cd /opt/videoshare-bot
+
+sudo cp systemd/videoshare-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now videoshare-bot
+Ver logs en directo:
+
+sudo journalctl -u videoshare-bot -f
+Reiniciar tras cambiar .env o actualizar código:
+
+sudo systemctl restart videoshare-bot
+Ver estado:
+
+sudo systemctl status videoshare-bot
+Si tu usuario no es pi, edita antes el servicio:
+
+sudo nano /etc/systemd/system/videoshare-bot.service
+y cambia User=pi por tu usuario. Luego:
+
+sudo systemctl daemon-reload
+sudo systemctl restart videoshare-bot
