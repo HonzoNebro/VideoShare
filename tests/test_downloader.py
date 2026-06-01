@@ -1,5 +1,7 @@
 from bot.downloader import (
     DownloadVariant,
+    TrimRange,
+    VideoDownloader,
     VideoMetadata,
     _audio_quality_kbps,
     _classify_yt_dlp_error,
@@ -7,6 +9,7 @@ from bot.downloader import (
     _parse_js_runtimes,
     _parse_remote_components,
     calculate_video_bitrate_kbps,
+    parse_trim_range,
     variant_cache_key,
 )
 
@@ -91,6 +94,43 @@ def test_variant_cache_key_includes_kind_and_quality() -> None:
 
     assert variant_cache_key(metadata, DownloadVariant("video", "high")) == "youtube:abc123:video-high"
     assert variant_cache_key(metadata, DownloadVariant("audio", "low")) == "youtube:abc123:audio-low"
+    assert (
+        variant_cache_key(
+            metadata,
+            DownloadVariant("video", "high"),
+            TrimRange(start_seconds=83.16, end_seconds=130),
+        )
+        == "youtube:abc123:video-high:clip-8316-13000"
+    )
+
+
+def test_parse_trim_range_accepts_centiseconds() -> None:
+    trim_range = parse_trim_range("01:23.16-02:10.00")
+
+    assert trim_range.start_seconds == 83.16
+    assert trim_range.end_seconds == 130
+    assert trim_range.normalized_text == "01:23.16-02:10.00"
+
+
+def test_parse_trim_range_accepts_long_minutes() -> None:
+    trim_range = parse_trim_range("123:45.67-124:00.00")
+
+    assert trim_range.start_seconds == 7425.67
+    assert trim_range.end_seconds == 7440
+
+
+def test_parse_trim_range_rejects_invalid_ranges() -> None:
+    for value in [
+        "01:23:164-02:10:000",
+        "01:60.00-02:00.00",
+        "02:00.00-01:00.00",
+    ]:
+        try:
+            parse_trim_range(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{value!r} should be rejected")
 
 
 def test_video_variant_format_selectors() -> None:
@@ -108,6 +148,48 @@ def test_audio_variant_format_and_quality() -> None:
     assert _audio_quality_kbps(DownloadVariant("audio", "high")) == "192"
     assert _audio_quality_kbps(DownloadVariant("audio", "medium")) == "128"
     assert _audio_quality_kbps(DownloadVariant("audio", "low")) == "64"
+
+
+def test_fetch_with_metadata_sync_passes_trim_through_pipeline(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    metadata = VideoMetadata(
+        video_id="abc123",
+        title=None,
+        description=None,
+        source_url="https://youtu.be/abc123",
+        webpage_url="https://www.youtube.com/watch?v=abc123",
+        uploader=None,
+        extractor="Youtube",
+        duration=30,
+        estimated_size_bytes=None,
+    )
+    variant = DownloadVariant("video", "low")
+    trim_range = TrimRange(start_seconds=1, end_seconds=2)
+    calls: list[object] = []
+
+    def fake_download(url, task_dir, selected_variant, progress, selected_trim):
+        calls.append(("download", url, selected_variant, selected_trim))
+        path = task_dir / "video.mp4"
+        path.write_bytes(b"video")
+        return path
+
+    def fake_trim(path, selected_trim, selected_variant, progress, *, section_downloaded=False):
+        calls.append(("trim", selected_trim, selected_variant))
+        return path
+
+    def fake_ensure(path, selected_metadata, selected_variant, progress):
+        calls.append(("ensure", selected_metadata, selected_variant))
+        return path
+
+    monkeypatch.setattr(downloader, "_download", fake_download)
+    monkeypatch.setattr(downloader, "_trim_download", fake_trim)
+    monkeypatch.setattr(downloader, "_ensure_sendable", fake_ensure)
+
+    result = downloader._fetch_with_metadata_sync(metadata, variant, trim_range)
+
+    assert result.trim_range == trim_range
+    assert calls[0] == ("download", metadata.source_url, variant, trim_range)
+    assert calls[1] == ("trim", trim_range, variant)
 
 
 def test_classify_youtube_bot_verification_error() -> None:

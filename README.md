@@ -136,6 +136,7 @@ Comandos utiles:
 - Soporta enlaces publicos de sitios admitidos por `yt-dlp`.
 - No usa cookies ni cuentas de terceros.
 - Permite elegir video o solo audio y tres niveles de calidad por enlace.
+- Permite recortar video o audio indicando un rango `MM:SS.cc-MM:SS.cc`.
 - Intenta producir MP4 para video y M4A/MP3 para audio.
 - Si el archivo supera `MAX_UPLOAD_MB`, intenta reducir calidad con `ffmpeg`.
 - Si no puede reducirlo lo suficiente, devuelve un aviso y el enlace original.

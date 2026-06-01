@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from html import escape
 import logging
 from pathlib import Path
@@ -24,9 +24,11 @@ from bot.downloader import (
     DownloadError,
     DownloadVariant,
     OversizeError,
+    TrimRange,
     VideoDownloader,
     VideoMetadata,
     VideoResult,
+    parse_trim_range,
     variant_cache_key,
 )
 from bot.formatting import build_caption, extract_urls, text_mentions_bot
@@ -54,6 +56,15 @@ class PendingSelection:
     metadata: VideoMetadata
     target: SendTarget
     created_at: float
+    trim_range: TrimRange | None = None
+
+
+@dataclass(frozen=True)
+class PendingTrimRequest:
+    token: str
+    kind: str
+    message_id: int | None
+    created_at: float
 
 
 class BotServices:
@@ -70,6 +81,7 @@ class BotServices:
         self._job_semaphore: asyncio.Semaphore | None = None
         self._cache_key_locks: dict[str, asyncio.Lock] = {}
         self.pending_selections: dict[str, PendingSelection] = {}
+        self.pending_trim_requests: dict[tuple[int, int], PendingTrimRequest] = {}
         self.active_jobs = 0
         self.queued_jobs = 0
 
@@ -156,6 +168,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     urls = extract_urls(message.text or message.caption)
     if not urls:
+        if await _handle_trim_range_message(update, context, services):
+            return
         return
 
     status = await message.reply_text(_progress_text("Preparando", 1, len(urls), 5))
@@ -175,33 +189,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
             await progress.update("Obteniendo informacion", 10, force=True)
             normalized_url = normalize_url(url)
-            alias_key = services.cache.get_alias(normalized_url)
-            if alias_key:
-                rejected = services.cache.get_rejection(alias_key)
-                if rejected:
-                    await progress.update("Rechazado desde cache", 100, force=True)
-                    await message.reply_text(f"{rejected.message}\n\n{url}")
-                    continue
 
             timeout_message = "La extraccion de informacion ha tardado demasiado y se ha cancelado."
             metadata = await services.downloader.extract_metadata(url, progress=progress.threadsafe_update)
             services.cache.put_alias(normalized_url=normalized_url, cache_key=metadata.cache_key)
-            rejected = services.cache.get_rejection(metadata.cache_key)
-            if rejected:
-                await progress.update("Rechazado desde cache", 100, force=True)
-                await message.reply_text(f"{rejected.message}\n\n{url}")
-                continue
-            try:
-                _validate_metadata_limits(services.settings, metadata)
-            except OversizeError as exc:
-                services.cache.put_rejection(
-                    cache_key=metadata.cache_key,
-                    message=str(exc),
-                    **_metadata_cache_fields(metadata),
-                )
-                await message.reply_text(f"{exc}\n\n{url}")
-                continue
-
             if not update.effective_chat:
                 continue
             token = _create_pending_selection(
@@ -271,8 +262,46 @@ async def handle_variant_callback(update: Update, context: ContextTypes.DEFAULT_
             return
         await _edit_query_message(
             query.message,
-            _quality_text(pending.metadata, kind),
-            reply_markup=_quality_keyboard(token, kind),
+            _quality_text(pending.metadata, kind, pending.trim_range),
+            reply_markup=_quality_keyboard(token, kind, pending.trim_range),
+        )
+        return
+
+    if action == "trim" and len(parts) == 4:
+        kind = parts[3]
+        if kind not in {"video", "audio"}:
+            return
+        user_id = update.effective_user.id if update.effective_user else None
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if user_id is None or chat_id is None:
+            return
+        services.pending_trim_requests[(chat_id, user_id)] = PendingTrimRequest(
+            token=token,
+            kind=kind,
+            message_id=getattr(query.message, "message_id", None),
+            created_at=time.time(),
+        )
+        await _edit_query_message(
+            query.message,
+            _trim_prompt_text(pending.metadata, kind),
+            reply_markup=_trim_cancel_keyboard(token, kind),
+        )
+        return
+
+    if action == "untrim" and len(parts) == 4:
+        kind = parts[3]
+        if kind not in {"video", "audio"}:
+            return
+        if update.effective_chat and update.effective_user:
+            services.pending_trim_requests.pop(
+                (update.effective_chat.id, update.effective_user.id),
+                None,
+            )
+        services.pending_selections[token] = replace(pending, trim_range=None)
+        await _edit_query_message(
+            query.message,
+            _quality_text(pending.metadata, kind, None),
+            reply_markup=_quality_keyboard(token, kind, None),
         )
         return
 
@@ -286,7 +315,7 @@ async def handle_variant_callback(update: Update, context: ContextTypes.DEFAULT_
     except ValueError:
         return
 
-    services.pending_selections.pop(token, None)
+    pending = services.pending_selections.pop(token, pending)
     await _process_variant_selection(update, context, services, pending, variant)
 
 
@@ -308,10 +337,11 @@ async def _process_variant_selection(
         1,
         edit_interval_seconds=services.settings.progress_update_interval_seconds,
     )
-    cache_key = variant_cache_key(pending.metadata, variant)
+    cache_key = variant_cache_key(pending.metadata, variant, pending.trim_range)
     timeout_message = "La operacion ha tardado demasiado y se ha cancelado."
     try:
         await progress.update("Preparando seleccion", 5, force=True)
+        _validate_selection_limits(services.settings, pending.metadata, pending.trim_range)
         rejected = services.cache.get_rejection(cache_key)
         if rejected:
             await progress.update("Rechazado desde cache", 100, force=True)
@@ -351,6 +381,7 @@ async def _process_variant_selection(
                 result = await services.downloader.fetch_with_metadata(
                     pending.metadata,
                     variant=variant,
+                    trim_range=pending.trim_range,
                     progress=progress.threadsafe_update,
                 )
                 await progress.update("Subiendo a Telegram", 85, force=True)
@@ -432,7 +463,7 @@ async def _send_result(
                     parse_mode=parse_mode,
                     reply_to_message_id=target.reply_to_message_id,
                 )
-                _cache_sent_message(services, result.metadata, result.variant, sent)
+                _cache_sent_message(services, result.metadata, result.variant, sent, result.trim_range)
                 return
             except TimedOut:
                 LOGGER.info("send_audio timed out while waiting for Telegram response", exc_info=True)
@@ -450,7 +481,7 @@ async def _send_result(
                 supports_streaming=True,
                 reply_to_message_id=target.reply_to_message_id,
             )
-            _cache_sent_message(services, result.metadata, result.variant, sent)
+            _cache_sent_message(services, result.metadata, result.variant, sent, result.trim_range)
             return
         except TimedOut:
             LOGGER.info("send_video timed out while waiting for Telegram response", exc_info=True)
@@ -470,7 +501,7 @@ async def _send_result(
             parse_mode=parse_mode,
             reply_to_message_id=target.reply_to_message_id,
         )
-        _cache_sent_message(services, result.metadata, result.variant, sent)
+        _cache_sent_message(services, result.metadata, result.variant, sent, result.trim_range)
 
 
 async def _send_cached(
@@ -523,6 +554,62 @@ def _services(context: ContextTypes.DEFAULT_TYPE) -> BotServices:
     return context.application.bot_data["services"]
 
 
+async def _handle_trim_range_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    services: BotServices,
+) -> bool:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user:
+        return False
+
+    _prune_pending_trim_requests(services)
+    request = services.pending_trim_requests.get((chat.id, user.id))
+    if not request:
+        return False
+
+    pending = services.pending_selections.get(request.token)
+    if not pending:
+        services.pending_trim_requests.pop((chat.id, user.id), None)
+        await message.reply_text("La seleccion ha caducado. Reenvia el enlace para elegir formato y calidad.")
+        return True
+
+    try:
+        trim_range = parse_trim_range(message.text or "")
+        _validate_trim_range(services.settings, pending.metadata, trim_range)
+    except ValueError as exc:
+        await message.reply_text(
+            f"{exc}\n\nUsa el formato MM:SS.cc-MM:SS.cc, por ejemplo 01:23.16-02:10.00."
+        )
+        return True
+    except OversizeError as exc:
+        await message.reply_text(str(exc))
+        return True
+
+    services.pending_trim_requests.pop((chat.id, user.id), None)
+    pending = replace(pending, trim_range=trim_range)
+    services.pending_selections[request.token] = pending
+    text = _quality_text(pending.metadata, request.kind, trim_range)
+    markup = _quality_keyboard(request.token, request.kind, trim_range)
+    if request.message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat.id,
+                message_id=request.message_id,
+                text=text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+            return True
+        except TelegramError:
+            LOGGER.debug("Could not edit trim prompt message", exc_info=True)
+
+    await message.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
+    return True
+
+
 async def _acquire_job_slot(services: BotServices, progress: ProgressEditor) -> None:
     if services.job_semaphore.locked():
         services.queued_jobs += 1
@@ -572,6 +659,17 @@ def _prune_pending_selections(services: BotServices, ttl_seconds: int = 3600) ->
         services.pending_selections.pop(token, None)
 
 
+def _prune_pending_trim_requests(services: BotServices, ttl_seconds: int = 3600) -> None:
+    cutoff = time.time() - ttl_seconds
+    expired = [
+        key
+        for key, request in services.pending_trim_requests.items()
+        if request.created_at < cutoff
+    ]
+    for key in expired:
+        services.pending_trim_requests.pop(key, None)
+
+
 def _kind_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Video", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:video"),
@@ -579,11 +677,31 @@ def _kind_keyboard(token: str) -> InlineKeyboardMarkup:
     ]])
 
 
-def _quality_keyboard(token: str, kind: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
+def _quality_keyboard(
+    token: str,
+    kind: str,
+    trim_range: TrimRange | None = None,
+) -> InlineKeyboardMarkup:
+    rows = [[
         InlineKeyboardButton("Alta", callback_data=f"{CALLBACK_PREFIX}:{token}:quality:{kind}:high"),
         InlineKeyboardButton("Media", callback_data=f"{CALLBACK_PREFIX}:{token}:quality:{kind}:medium"),
         InlineKeyboardButton("Baja", callback_data=f"{CALLBACK_PREFIX}:{token}:quality:{kind}:low"),
+    ]]
+    if trim_range:
+        rows.append([
+            InlineKeyboardButton("Cambiar recorte", callback_data=f"{CALLBACK_PREFIX}:{token}:trim:{kind}"),
+            InlineKeyboardButton("Quitar recorte", callback_data=f"{CALLBACK_PREFIX}:{token}:untrim:{kind}"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton("Recortar", callback_data=f"{CALLBACK_PREFIX}:{token}:trim:{kind}"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _trim_cancel_keyboard(token: str, kind: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Sin recorte", callback_data=f"{CALLBACK_PREFIX}:{token}:untrim:{kind}"),
     ]])
 
 
@@ -592,10 +710,25 @@ def _selection_text(metadata: VideoMetadata, source_url: str) -> str:
     return f"{title}\n\nElige formato para procesar este enlace:\n{source_url}"
 
 
-def _quality_text(metadata: VideoMetadata, kind: str) -> str:
+def _quality_text(
+    metadata: VideoMetadata,
+    kind: str,
+    trim_range: TrimRange | None = None,
+) -> str:
     title = metadata.title or "Enlace detectado"
     label = "video" if kind == "video" else "audio"
-    return f"{title}\n\nElige calidad de {label}:"
+    suffix = f"\nRecorte: {trim_range.normalized_text}" if trim_range else ""
+    return f"{title}\n\nElige calidad de {label}:{suffix}"
+
+
+def _trim_prompt_text(metadata: VideoMetadata, kind: str) -> str:
+    title = metadata.title or "Enlace detectado"
+    label = "video" if kind == "video" else "audio"
+    return (
+        f"{title}\n\n"
+        f"Responde con el tramo de {label} en formato MM:SS.cc-MM:SS.cc.\n"
+        "Ejemplo: 01:23.16-02:10.00"
+    )
 
 
 async def _edit_query_message(
@@ -681,13 +814,41 @@ def _validate_metadata_limits(settings: Settings, metadata: VideoMetadata) -> No
         )
 
 
+def _validate_selection_limits(
+    settings: Settings,
+    metadata: VideoMetadata,
+    trim_range: TrimRange | None,
+) -> None:
+    if trim_range:
+        _validate_trim_range(settings, metadata, trim_range)
+        return
+    _validate_metadata_limits(settings, metadata)
+
+
+def _validate_trim_range(
+    settings: Settings,
+    metadata: VideoMetadata,
+    trim_range: TrimRange,
+) -> None:
+    if trim_range.duration_seconds > settings.max_video_duration_seconds:
+        raise OversizeError(
+            f"El recorte dura demasiado ({int(trim_range.duration_seconds)}s). "
+            f"Limite configurado: {settings.max_video_duration_seconds}s."
+        )
+    if metadata.duration and trim_range.end_seconds > metadata.duration + 0.01:
+        raise OversizeError(
+            f"El fin del recorte supera la duracion del video ({int(metadata.duration)}s)."
+        )
+
+
 def _cache_sent_message(
     services: BotServices,
     metadata: VideoMetadata,
     variant: DownloadVariant,
     sent_message: object,
+    trim_range: TrimRange | None = None,
 ) -> None:
-    cache_key = variant_cache_key(metadata, variant)
+    cache_key = variant_cache_key(metadata, variant, trim_range)
     audio = getattr(sent_message, "audio", None)
     if audio and getattr(audio, "file_id", None):
         services.cache.put(

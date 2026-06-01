@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import logging
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,11 @@ from typing import Any, Callable, cast
 
 import yt_dlp
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
+
+try:
+    from yt_dlp.utils import download_range_func
+except ImportError:  # pragma: no cover - depends on yt-dlp version
+    download_range_func = None
 
 LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, int], None]
@@ -44,6 +50,36 @@ class DownloadVariant:
 
 
 @dataclass(frozen=True)
+class TrimRange:
+    start_seconds: float
+    end_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.start_seconds < 0 or self.end_seconds <= self.start_seconds:
+            raise ValueError("Invalid trim range")
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.end_seconds - self.start_seconds
+
+    @property
+    def start_centiseconds(self) -> int:
+        return int(round(self.start_seconds * 100))
+
+    @property
+    def end_centiseconds(self) -> int:
+        return int(round(self.end_seconds * 100))
+
+    @property
+    def cache_suffix(self) -> str:
+        return f"clip-{self.start_centiseconds}-{self.end_centiseconds}"
+
+    @property
+    def normalized_text(self) -> str:
+        return f"{_format_centiseconds(self.start_centiseconds)}-{_format_centiseconds(self.end_centiseconds)}"
+
+
+@dataclass(frozen=True)
 class VideoMetadata:
     video_id: str | None
     title: str | None
@@ -70,6 +106,7 @@ class VideoResult:
     file_path: Path
     metadata: VideoMetadata
     variant: DownloadVariant
+    trim_range: TrimRange | None = None
 
     @property
     def size_bytes(self) -> int:
@@ -90,8 +127,33 @@ def _metadata_from_info(info: dict[str, Any], fallback_url: str) -> VideoMetadat
     )
 
 
-def variant_cache_key(metadata: VideoMetadata, variant: DownloadVariant) -> str:
-    return f"{metadata.cache_key}:{variant.cache_suffix}"
+def variant_cache_key(
+    metadata: VideoMetadata,
+    variant: DownloadVariant,
+    trim_range: TrimRange | None = None,
+) -> str:
+    key = f"{metadata.cache_key}:{variant.cache_suffix}"
+    if trim_range:
+        key = f"{key}:{trim_range.cache_suffix}"
+    return key
+
+
+TRIM_RANGE_RE = re.compile(r"^\s*(\d+):([0-5]\d)\.(\d{2})\s*-\s*(\d+):([0-5]\d)\.(\d{2})\s*$")
+
+
+def parse_trim_range(raw: str) -> TrimRange:
+    match = TRIM_RANGE_RE.match(raw)
+    if not match:
+        raise ValueError("Formato de recorte no valido.")
+
+    start_minutes, start_seconds, start_centis, end_minutes, end_seconds, end_centis = (
+        int(group) for group in match.groups()
+    )
+    start = start_minutes * 60 + start_seconds + start_centis / 100
+    end = end_minutes * 60 + end_seconds + end_centis / 100
+    if end <= start:
+        raise ValueError("El fin del recorte debe ser posterior al inicio.")
+    return TrimRange(start_seconds=start, end_seconds=end)
 
 
 def calculate_video_bitrate_kbps(
@@ -110,6 +172,12 @@ def calculate_video_bitrate_kbps(
     if video_kbps < minimum_video_kbps:
         return None
     return video_kbps
+
+
+def _format_centiseconds(total_centiseconds: int) -> str:
+    minutes, remainder = divmod(total_centiseconds, 60 * 100)
+    seconds, centiseconds = divmod(remainder, 100)
+    return f"{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
 
 
 class VideoDownloader:
@@ -139,10 +207,16 @@ class VideoDownloader:
         url: str,
         *,
         variant: DownloadVariant | None = None,
+        trim_range: TrimRange | None = None,
         progress: ProgressCallback | None = None,
     ) -> VideoResult:
         metadata = await self.extract_metadata(url, progress=progress)
-        return await self.fetch_with_metadata(metadata, variant=variant, progress=progress)
+        return await self.fetch_with_metadata(
+            metadata,
+            variant=variant,
+            trim_range=trim_range,
+            progress=progress,
+        )
 
     async def extract_metadata(
         self,
@@ -159,11 +233,18 @@ class VideoDownloader:
         metadata: VideoMetadata,
         *,
         variant: DownloadVariant | None = None,
+        trim_range: TrimRange | None = None,
         progress: ProgressCallback | None = None,
     ) -> VideoResult:
         selected_variant = variant or DownloadVariant("video", "medium")
         return await asyncio.wait_for(
-            asyncio.to_thread(self._fetch_with_metadata_sync, metadata, selected_variant, progress),
+            asyncio.to_thread(
+                self._fetch_with_metadata_sync,
+                metadata,
+                selected_variant,
+                trim_range,
+                progress,
+            ),
             timeout=self.timeout_seconds,
         )
 
@@ -182,6 +263,7 @@ class VideoDownloader:
         self,
         metadata: VideoMetadata,
         variant: DownloadVariant,
+        trim_range: TrimRange | None = None,
         progress: ProgressCallback | None = None,
     ) -> VideoResult:
         self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -189,9 +271,21 @@ class VideoDownloader:
 
         try:
             _report(progress, _download_label(variant), 25)
-            downloaded = self._download(metadata.source_url, task_dir, variant, progress)
-            sendable = self._ensure_sendable(downloaded, metadata, variant, progress)
-            return VideoResult(file_path=sendable, metadata=metadata, variant=variant)
+            downloaded = self._download(metadata.source_url, task_dir, variant, progress, trim_range)
+            prepared = self._trim_download(
+                downloaded,
+                trim_range,
+                variant,
+                progress,
+                section_downloaded=bool(trim_range and download_range_func),
+            )
+            sendable = self._ensure_sendable(prepared, metadata, variant, progress)
+            return VideoResult(
+                file_path=sendable,
+                metadata=metadata,
+                variant=variant,
+                trim_range=trim_range,
+            )
         except YtDlpDownloadError as exc:
             shutil.rmtree(task_dir, ignore_errors=True)
             raise DownloadError(_classify_yt_dlp_error(str(exc))) from exc
@@ -227,6 +321,7 @@ class VideoDownloader:
         task_dir: Path,
         variant: DownloadVariant,
         progress: ProgressCallback | None,
+        trim_range: TrimRange | None = None,
     ) -> Path:
         output_template = str(task_dir / "%(title).180B-%(id)s.%(ext)s")
         opts: dict[str, Any] = self._base_ydl_opts()
@@ -242,6 +337,12 @@ class VideoDownloader:
             "overwrites": True,
             "progress_hooks": [_download_progress_hook(progress)] if progress else [],
         })
+        if trim_range and download_range_func:
+            opts["download_ranges"] = download_range_func(
+                None,
+                [(trim_range.start_seconds, trim_range.end_seconds)],
+            )
+            opts["force_keyframes_at_cuts"] = True
         if variant.kind == "audio":
             opts["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
@@ -272,6 +373,81 @@ class VideoDownloader:
             return candidates[0]
 
         raise DownloadError("No he encontrado el archivo descargado.")
+
+    def _trim_download(
+        self,
+        file_path: Path,
+        trim_range: TrimRange | None,
+        variant: DownloadVariant,
+        progress: ProgressCallback | None,
+        *,
+        section_downloaded: bool = False,
+    ) -> Path:
+        if not trim_range:
+            return file_path
+
+        suffix = ".trimmed.m4a" if variant.kind == "audio" else ".trimmed.mp4"
+        output_path = file_path.with_suffix(suffix)
+        effective_range = (
+            TrimRange(start_seconds=0, end_seconds=trim_range.duration_seconds)
+            if section_downloaded
+            else trim_range
+        )
+        _report(progress, "Recortando", 68)
+        if variant.kind == "audio":
+            self._trim_audio(file_path, output_path, effective_range, variant)
+        else:
+            self._trim_video(file_path, output_path, effective_range)
+        return output_path
+
+    def _trim_video(self, input_path: Path, output_path: Path, trim_range: TrimRange) -> None:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{trim_range.start_seconds:.2f}",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{trim_range.duration_seconds:.2f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        subprocess.run(command, check=True, capture_output=True)
+
+    def _trim_audio(
+        self,
+        input_path: Path,
+        output_path: Path,
+        trim_range: TrimRange,
+        variant: DownloadVariant,
+    ) -> None:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{trim_range.start_seconds:.2f}",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{trim_range.duration_seconds:.2f}",
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{_audio_quality_kbps(variant)}k",
+            str(output_path),
+        ]
+        subprocess.run(command, check=True, capture_output=True)
 
     def _ensure_sendable(
         self,

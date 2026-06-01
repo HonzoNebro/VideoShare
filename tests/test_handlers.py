@@ -6,16 +6,20 @@ from telegram.constants import ChatType
 from telegram.error import BadRequest
 
 from bot.config import Settings
-from bot.downloader import DownloadVariant, OversizeError, VideoMetadata
+from bot.downloader import DownloadVariant, OversizeError, TrimRange, VideoMetadata
 from bot.handlers import (
     BotServices,
+    PendingSelection,
+    PendingTrimRequest,
     SendTarget,
     _caption_for_chat,
     _cache_sent_message,
     _error_report_text,
+    _handle_trim_range_message,
     _kind_keyboard,
     _is_message_not_modified,
     _quality_keyboard,
+    _validate_selection_limits,
     _validate_metadata_limits,
     handle_variant_callback,
 )
@@ -84,6 +88,47 @@ def test_validate_metadata_limits_rejects_large_estimate() -> None:
 
     with pytest.raises(OversizeError):
         _validate_metadata_limits(_settings(), metadata)
+
+
+def test_validate_selection_limits_allows_valid_trim_from_long_video() -> None:
+    metadata = VideoMetadata(
+        video_id="id",
+        title=None,
+        description=None,
+        source_url="https://example.com/video",
+        webpage_url="https://example.com/video",
+        uploader=None,
+        extractor="Example",
+        duration=600,
+        estimated_size_bytes=None,
+    )
+
+    _validate_selection_limits(
+        _settings(),
+        metadata,
+        TrimRange(start_seconds=10, end_seconds=20),
+    )
+
+
+def test_validate_selection_limits_rejects_long_trim() -> None:
+    metadata = VideoMetadata(
+        video_id="id",
+        title=None,
+        description=None,
+        source_url="https://example.com/video",
+        webpage_url="https://example.com/video",
+        uploader=None,
+        extractor="Example",
+        duration=600,
+        estimated_size_bytes=None,
+    )
+
+    with pytest.raises(OversizeError):
+        _validate_selection_limits(
+            _settings(),
+            metadata,
+            TrimRange(start_seconds=10, end_seconds=80.01),
+        )
 
 
 def test_caption_for_private_full() -> None:
@@ -176,6 +221,21 @@ def test_variant_keyboards_use_short_callback_data() -> None:
     ]
     assert all(len(str(button.callback_data)) <= 64 for button in kind_buttons + quality_buttons)
 
+    assert _quality_keyboard("abc123", "video").inline_keyboard[1][0].text == "Recortar"
+
+    trimmed_keyboard = _quality_keyboard(
+        "abc123",
+        "video",
+        TrimRange(start_seconds=83.16, end_seconds=130),
+    )
+    trim_buttons = trimmed_keyboard.inline_keyboard[1]
+
+    assert [button.text for button in trim_buttons] == ["Cambiar recorte", "Quitar recorte"]
+    assert [button.callback_data for button in trim_buttons] == [
+        "vs:abc123:trim:video",
+        "vs:abc123:untrim:video",
+    ]
+
 
 def test_cache_sent_message_stores_variant_cache_key(tmp_path) -> None:
     from bot.cache import VideoCache
@@ -222,6 +282,55 @@ async def test_callback_with_expired_token_warns_user(monkeypatch) -> None:
 
     assert answers == ["La seleccion ha caducado."]
     assert edits == ["La seleccion ha caducado. Reenvia el enlace para elegir formato y calidad."]
+
+
+async def test_trim_range_message_updates_pending_selection() -> None:
+    replies: list[dict[str, object]] = []
+    edits: list[dict[str, object]] = []
+
+    async def reply_text(text: str, **kwargs: object) -> None:
+        replies.append({"text": text, **kwargs})
+
+    async def edit_message_text(**kwargs: object) -> None:
+        edits.append(kwargs)
+
+    services = BotServices(
+        settings=_settings(),
+        downloader=SimpleNamespace(),
+        cache=SimpleNamespace(),
+    )
+    services.pending_selections["abc123"] = PendingSelection(
+        source_url="https://example.com/video",
+        normalized_url="https://example.com/video",
+        metadata=_metadata(),
+        target=SendTarget(chat_id=123, chat_type=ChatType.PRIVATE, reply_to_message_id=1),
+        created_at=1,
+    )
+    services.pending_trim_requests[(123, 42)] = PendingTrimRequest(
+        token="abc123",
+        kind="audio",
+        message_id=77,
+        created_at=9999999999,
+    )
+    update = SimpleNamespace(
+        effective_message=SimpleNamespace(text="00:01.00-00:02.00", reply_text=reply_text),
+        effective_chat=SimpleNamespace(id=123),
+        effective_user=SimpleNamespace(id=42),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(edit_message_text=edit_message_text))
+
+    handled = await _handle_trim_range_message(update, context, services)
+
+    assert handled is True
+    assert services.pending_selections["abc123"].trim_range == TrimRange(
+        start_seconds=1,
+        end_seconds=2,
+    )
+    assert services.pending_trim_requests == {}
+    assert replies == []
+    assert edits[0]["chat_id"] == 123
+    assert edits[0]["message_id"] == 77
+    assert "Recorte: 00:01.00-00:02.00" in edits[0]["text"]
 
 
 async def test_send_cached_audio_uses_send_audio() -> None:
