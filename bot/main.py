@@ -79,6 +79,10 @@ def build_application() -> Application:
     cache = VideoCache(settings.cache_db_path, ttl_days=settings.cache_ttl_days)
 
     builder = Application.builder().token(settings.telegram_bot_token)
+    builder = builder.connect_timeout(settings.telegram_connect_timeout_seconds)
+    builder = builder.read_timeout(settings.telegram_read_timeout_seconds)
+    builder = builder.write_timeout(settings.telegram_write_timeout_seconds)
+    builder = builder.pool_timeout(settings.telegram_pool_timeout_seconds)
     if settings.telegram_api_base_url:
         builder = builder.base_url(settings.telegram_api_base_url)
     if settings.telegram_api_base_file_url:

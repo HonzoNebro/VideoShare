@@ -14,7 +14,7 @@ from telegram import Update
 from telegram import Message
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ChatType, ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
 from bot.auth import is_group_allowed, is_private_allowed
@@ -434,6 +434,9 @@ async def _send_result(
                 )
                 _cache_sent_message(services, result.metadata, result.variant, sent)
                 return
+            except TimedOut:
+                LOGGER.info("send_audio timed out while waiting for Telegram response", exc_info=True)
+                raise
             except TelegramError:
                 LOGGER.info("send_audio failed, trying send_document", exc_info=True)
 
@@ -449,6 +452,9 @@ async def _send_result(
             )
             _cache_sent_message(services, result.metadata, result.variant, sent)
             return
+        except TimedOut:
+            LOGGER.info("send_video timed out while waiting for Telegram response", exc_info=True)
+            raise
         except TelegramError:
             LOGGER.info("send_video failed, trying send_document", exc_info=True)
 

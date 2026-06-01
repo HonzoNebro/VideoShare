@@ -69,6 +69,10 @@ class Settings:
     telegram_api_base_url: str | None = None
     telegram_api_base_file_url: str | None = None
     telegram_local_mode: bool = False
+    telegram_connect_timeout_seconds: float = 30.0
+    telegram_read_timeout_seconds: float = 600.0
+    telegram_write_timeout_seconds: float = 600.0
+    telegram_pool_timeout_seconds: float = 30.0
     ytdlp_cookies_file: Path | None = None
     ytdlp_js_runtimes: str | None = None
     ytdlp_remote_components: str | None = None
@@ -118,6 +122,10 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         telegram_api_base_url=os.getenv("TELEGRAM_API_BASE_URL", "").strip() or None,
         telegram_api_base_file_url=os.getenv("TELEGRAM_API_BASE_FILE_URL", "").strip() or None,
         telegram_local_mode=_parse_bool(os.getenv("TELEGRAM_LOCAL_MODE"), default=False),
+        telegram_connect_timeout_seconds=float(os.getenv("TELEGRAM_CONNECT_TIMEOUT_SECONDS", "30")),
+        telegram_read_timeout_seconds=float(os.getenv("TELEGRAM_READ_TIMEOUT_SECONDS", "600")),
+        telegram_write_timeout_seconds=float(os.getenv("TELEGRAM_WRITE_TIMEOUT_SECONDS", "600")),
+        telegram_pool_timeout_seconds=float(os.getenv("TELEGRAM_POOL_TIMEOUT_SECONDS", "30")),
         ytdlp_cookies_file=(
             Path(os.getenv("YTDLP_COOKIES_FILE", "")).expanduser()
             if os.getenv("YTDLP_COOKIES_FILE", "").strip()

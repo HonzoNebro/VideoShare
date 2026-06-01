@@ -69,6 +69,10 @@ def test_load_settings_parses_env_file(tmp_path: Path) -> None:
                 "TELEGRAM_API_BASE_URL=http://127.0.0.1:8081/bot",
                 "TELEGRAM_API_BASE_FILE_URL=http://127.0.0.1:8081/file/bot",
                 "TELEGRAM_LOCAL_MODE=true",
+                "TELEGRAM_CONNECT_TIMEOUT_SECONDS=12.5",
+                "TELEGRAM_READ_TIMEOUT_SECONDS=345",
+                "TELEGRAM_WRITE_TIMEOUT_SECONDS=456",
+                "TELEGRAM_POOL_TIMEOUT_SECONDS=6",
                 f"YTDLP_COOKIES_FILE={tmp_path / 'cookies.txt'}",
                 "YTDLP_JS_RUNTIMES=deno",
                 "YTDLP_REMOTE_COMPONENTS=ejs:npm",
@@ -100,6 +104,10 @@ def test_load_settings_parses_env_file(tmp_path: Path) -> None:
     assert settings.telegram_api_base_url == "http://127.0.0.1:8081/bot"
     assert settings.telegram_api_base_file_url == "http://127.0.0.1:8081/file/bot"
     assert settings.telegram_local_mode is True
+    assert settings.telegram_connect_timeout_seconds == 12.5
+    assert settings.telegram_read_timeout_seconds == 345
+    assert settings.telegram_write_timeout_seconds == 456
+    assert settings.telegram_pool_timeout_seconds == 6
     assert settings.ytdlp_cookies_file == tmp_path / "cookies.txt"
     assert settings.ytdlp_js_runtimes == "deno"
     assert settings.ytdlp_remote_components == "ejs:npm"
@@ -133,6 +141,10 @@ def test_load_settings_uses_large_file_defaults(tmp_path: Path, monkeypatch) -> 
         "TELEGRAM_API_BASE_URL",
         "TELEGRAM_API_BASE_FILE_URL",
         "TELEGRAM_LOCAL_MODE",
+        "TELEGRAM_CONNECT_TIMEOUT_SECONDS",
+        "TELEGRAM_READ_TIMEOUT_SECONDS",
+        "TELEGRAM_WRITE_TIMEOUT_SECONDS",
+        "TELEGRAM_POOL_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -154,3 +166,7 @@ def test_load_settings_uses_large_file_defaults(tmp_path: Path, monkeypatch) -> 
     assert settings.telegram_api_base_url is None
     assert settings.telegram_api_base_file_url is None
     assert settings.telegram_local_mode is False
+    assert settings.telegram_connect_timeout_seconds == 30
+    assert settings.telegram_read_timeout_seconds == 600
+    assert settings.telegram_write_timeout_seconds == 600
+    assert settings.telegram_pool_timeout_seconds == 30

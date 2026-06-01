@@ -88,6 +88,8 @@ Para subir archivos nuevos de mas de 50 MB, usa un servidor local de Telegram Bo
 TELEGRAM_API_BASE_URL=http://127.0.0.1:8081/bot
 TELEGRAM_API_BASE_FILE_URL=http://127.0.0.1:8081/file/bot
 TELEGRAM_LOCAL_MODE=true
+TELEGRAM_READ_TIMEOUT_SECONDS=600
+TELEGRAM_WRITE_TIMEOUT_SECONDS=600
 ```
 
 Si el bot no ve mensajes del grupo, desactiva Privacy Mode en BotFather:
