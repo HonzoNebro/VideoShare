@@ -138,11 +138,13 @@ def variant_cache_key(
     return key
 
 
-TRIM_RANGE_RE = re.compile(r"^\s*(\d+):([0-5]\d)\.(\d{1,2})\s*-\s*(\d+):([0-5]\d)\.(\d{1,2})\s*$")
+TRIM_RANGE_PATTERN = r"(\d+):([0-5]\d)\.(\d{1,2})\s*-\s*(\d+):([0-5]\d)\.(\d{1,2})"
+TRIM_RANGE_RE = re.compile(rf"^\s*{TRIM_RANGE_PATTERN}\s*$")
+TRIM_RANGE_SEARCH_RE = re.compile(TRIM_RANGE_PATTERN)
 
 
 def parse_trim_range(raw: str) -> TrimRange:
-    match = TRIM_RANGE_RE.match(raw)
+    match = TRIM_RANGE_RE.match(raw) or TRIM_RANGE_SEARCH_RE.search(raw)
     if not match:
         raise ValueError("Formato de recorte no valido.")
 
