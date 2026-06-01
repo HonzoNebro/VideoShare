@@ -112,6 +112,14 @@ def test_parse_trim_range_accepts_centiseconds() -> None:
     assert trim_range.normalized_text == "01:23.16-02:10.00"
 
 
+def test_parse_trim_range_accepts_single_decimal_centiseconds() -> None:
+    trim_range = parse_trim_range("0:22.5-0:24.5")
+
+    assert trim_range.start_seconds == 22.5
+    assert trim_range.end_seconds == 24.5
+    assert trim_range.normalized_text == "00:22.50-00:24.50"
+
+
 def test_parse_trim_range_accepts_long_minutes() -> None:
     trim_range = parse_trim_range("123:45.67-124:00.00")
 

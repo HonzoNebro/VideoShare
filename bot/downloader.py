@@ -138,7 +138,7 @@ def variant_cache_key(
     return key
 
 
-TRIM_RANGE_RE = re.compile(r"^\s*(\d+):([0-5]\d)\.(\d{2})\s*-\s*(\d+):([0-5]\d)\.(\d{2})\s*$")
+TRIM_RANGE_RE = re.compile(r"^\s*(\d+):([0-5]\d)\.(\d{1,2})\s*-\s*(\d+):([0-5]\d)\.(\d{1,2})\s*$")
 
 
 def parse_trim_range(raw: str) -> TrimRange:
@@ -146,9 +146,12 @@ def parse_trim_range(raw: str) -> TrimRange:
     if not match:
         raise ValueError("Formato de recorte no valido.")
 
-    start_minutes, start_seconds, start_centis, end_minutes, end_seconds, end_centis = (
-        int(group) for group in match.groups()
-    )
+    start_minutes = int(match.group(1))
+    start_seconds = int(match.group(2))
+    start_centis = _parse_centiseconds(match.group(3))
+    end_minutes = int(match.group(4))
+    end_seconds = int(match.group(5))
+    end_centis = _parse_centiseconds(match.group(6))
     start = start_minutes * 60 + start_seconds + start_centis / 100
     end = end_minutes * 60 + end_seconds + end_centis / 100
     if end <= start:
@@ -178,6 +181,10 @@ def _format_centiseconds(total_centiseconds: int) -> str:
     minutes, remainder = divmod(total_centiseconds, 60 * 100)
     seconds, centiseconds = divmod(remainder, 100)
     return f"{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def _parse_centiseconds(raw: str) -> int:
+    return int(raw) * 10 if len(raw) == 1 else int(raw)
 
 
 class VideoDownloader:

@@ -943,6 +943,9 @@ def _is_update_allowed(
     if not is_group_allowed(services.settings, chat):
         return False
 
+    if update.effective_user and (chat.id, update.effective_user.id) in services.pending_trim_requests:
+        return True
+
     bot_username = context.bot.username
     text = message.text or message.caption if message else None
     return text_mentions_bot(text, bot_username)

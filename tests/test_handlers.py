@@ -16,6 +16,7 @@ from bot.handlers import (
     _cache_sent_message,
     _error_report_text,
     _handle_trim_range_message,
+    _is_update_allowed,
     _kind_keyboard,
     _is_message_not_modified,
     _quality_keyboard,
@@ -331,6 +332,28 @@ async def test_trim_range_message_updates_pending_selection() -> None:
     assert edits[0]["chat_id"] == 123
     assert edits[0]["message_id"] == 77
     assert "Recorte: 00:01.00-00:02.00" in edits[0]["text"]
+
+
+def test_group_trim_reply_is_allowed_without_bot_mention() -> None:
+    services = BotServices(
+        settings=_settings(),
+        downloader=SimpleNamespace(),
+        cache=SimpleNamespace(),
+    )
+    services.pending_trim_requests[(-100, 42)] = PendingTrimRequest(
+        token="abc123",
+        kind="video",
+        message_id=77,
+        created_at=9999999999,
+    )
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=-100, type=ChatType.GROUP),
+        effective_user=SimpleNamespace(id=42),
+        effective_message=SimpleNamespace(text="0:22.5-0:24.5", caption=None),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(username="compartirvideosbot"))
+
+    assert _is_update_allowed(update, context, services)
 
 
 async def test_send_cached_audio_uses_send_audio() -> None:
