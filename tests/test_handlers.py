@@ -18,6 +18,7 @@ from bot.handlers import (
     _handle_trim_range_message,
     _is_update_allowed,
     _kind_keyboard,
+    _process_variant_selection,
     _is_message_not_modified,
     _quality_keyboard,
     _validate_selection_limits,
@@ -390,3 +391,71 @@ async def test_send_cached_audio_uses_send_audio() -> None:
         "parse_mode": None,
         "reply_to_message_id": 99,
     }]
+
+
+async def test_successful_cached_selection_deletes_progress_message(monkeypatch) -> None:
+    from bot.cache import CacheEntry
+
+    edits: list[str] = []
+    sends: list[object] = []
+    deletes: list[object] = []
+
+    class FakeCache:
+        def get_rejection(self, cache_key: str) -> None:
+            return None
+
+        def get(self, cache_key: str) -> CacheEntry:
+            return CacheEntry(
+                cache_key=cache_key,
+                media_type="video",
+                file_id="video-file",
+                file_unique_id=None,
+                title=None,
+                description=None,
+                webpage_url=None,
+                uploader=None,
+                created_at=1,
+                last_used_at=1,
+            )
+
+        def delete(self, cache_key: str) -> None:
+            raise AssertionError("cache should not be deleted")
+
+    async def fake_send_cached(context, services, metadata, target, cached) -> None:
+        sends.append(cached)
+
+    async def fake_delete_status(status) -> None:
+        deletes.append(status)
+
+    async def edit_text(text: str) -> None:
+        edits.append(text)
+
+    monkeypatch.setattr("bot.handlers._send_cached", fake_send_cached)
+    monkeypatch.setattr("bot.handlers._safe_delete_status", fake_delete_status)
+    services = BotServices(
+        settings=_settings(),
+        downloader=SimpleNamespace(),
+        cache=FakeCache(),
+    )
+    status = SimpleNamespace(edit_text=edit_text)
+    pending = PendingSelection(
+        source_url="https://example.com/video",
+        normalized_url="https://example.com/video",
+        metadata=_metadata(),
+        target=SendTarget(chat_id=123, chat_type=ChatType.PRIVATE, reply_to_message_id=1),
+        created_at=1,
+    )
+    update = SimpleNamespace(effective_message=status)
+    context = SimpleNamespace()
+
+    await _process_variant_selection(
+        update,
+        context,
+        services,
+        pending,
+        DownloadVariant("video", "low"),
+    )
+
+    assert sends
+    assert deletes == [status]
+    assert not any("Completado" in edit for edit in edits)

@@ -358,7 +358,7 @@ async def _process_variant_selection(
                 await progress.update("Enviando desde cache", 90, force=True)
                 try:
                     await _send_cached(context, services, pending.metadata, pending.target, cached)
-                    await progress.update("Completado desde cache", 100, force=True)
+                    await _safe_delete_status(status)
                     return
                 except TelegramError:
                     LOGGER.info("Cached Telegram file_id failed, deleting cache entry", exc_info=True)
@@ -390,7 +390,7 @@ async def _process_variant_selection(
                     _send_result(context, services, result, pending.target),
                     timeout=services.settings.upload_timeout_seconds,
                 )
-                await progress.update("Completado", 100, force=True)
+                await _safe_delete_status(status)
             finally:
                 _release_job_slot(services)
     except asyncio.TimeoutError:
