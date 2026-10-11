@@ -1,18 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import asyncio
 import hashlib
+from http.cookiejar import MozillaCookieJar
 import logging
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 from typing import Any, Callable, cast
+from urllib.parse import urlparse
+import urllib.request
 
 import yt_dlp
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
+from PIL import Image
 
 try:
     from yt_dlp.utils import download_range_func
@@ -23,6 +28,7 @@ LOGGER = logging.getLogger(__name__)
 ProgressCallback = Callable[[str, int], None]
 VariantKind = str
 VariantQuality = str
+TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024
 
 
 class DownloadError(RuntimeError):
@@ -47,6 +53,23 @@ class DownloadVariant:
     @property
     def cache_suffix(self) -> str:
         return f"{self.kind}-{self.quality}"
+
+
+@dataclass(frozen=True)
+class ImageVariant:
+    quality: VariantQuality
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.quality not in {"high", "medium", "low"}:
+            raise ValueError(f"Unsupported image quality: {self.quality}")
+        if self.count not in {1, -1}:
+            raise ValueError(f"Unsupported image count: {self.count}")
+
+    @property
+    def cache_suffix(self) -> str:
+        count_str = "all" if self.count == -1 else str(self.count)
+        return f"image-{self.quality}-count{count_str}"
 
 
 @dataclass(frozen=True)
@@ -90,6 +113,10 @@ class VideoMetadata:
     extractor: str | None
     duration: float | None
     estimated_size_bytes: int | None
+    is_video: bool = True
+    is_image: bool = False
+    image_count: int = 0
+    image_urls: list[str] = field(default_factory=list)
 
     @property
     def cache_key(self) -> str:
@@ -99,6 +126,15 @@ class VideoMetadata:
         canonical = self.webpage_url or self.source_url
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return f"url:{digest}"
+
+    @property
+    def content_type(self) -> str:
+        """Returns 'video', 'image', or 'mixed'."""
+        if self.is_video and self.is_image:
+            return "mixed"
+        if self.is_image:
+            return "image"
+        return "video"
 
 
 @dataclass(frozen=True)
@@ -113,7 +149,26 @@ class VideoResult:
         return self.file_path.stat().st_size
 
 
+@dataclass(frozen=True)
+class ImageResult:
+    file_paths: list[Path]
+    metadata: VideoMetadata
+    variant: ImageVariant
+
+    @property
+    def size_bytes(self) -> int:
+        """Total size of all images."""
+        return sum(path.stat().st_size for path in self.file_paths)
+
+    @property
+    def count(self) -> int:
+        """Number of images."""
+        return len(self.file_paths)
+
+
 def _metadata_from_info(info: dict[str, Any], fallback_url: str) -> VideoMetadata:
+    is_video, is_image, image_count, image_urls = _detect_content_type(info)
+
     return VideoMetadata(
         video_id=info.get("id"),
         title=info.get("title"),
@@ -124,12 +179,92 @@ def _metadata_from_info(info: dict[str, Any], fallback_url: str) -> VideoMetadat
         extractor=info.get("extractor_key") or info.get("extractor"),
         duration=info.get("duration"),
         estimated_size_bytes=_estimated_size_bytes(info),
+        is_video=is_video,
+        is_image=is_image,
+        image_count=image_count,
+        image_urls=image_urls,
     )
+
+
+def _detect_content_type(info: dict[str, Any]) -> tuple[bool, bool, int, list[str]]:
+    image_urls: list[str] = []
+    entries = [entry for entry in info.get("entries") or [] if isinstance(entry, dict)]
+    for entry in entries:
+        image_url = _image_url_from_info(entry, allow_thumbnail_fallback=True)
+        if image_url:
+            image_urls.append(image_url)
+
+    direct_image_url = _image_url_from_info(info, allow_thumbnail_fallback=not _has_video(info))
+    if direct_image_url:
+        image_urls.insert(0, direct_image_url)
+
+    image_urls = _dedupe_preserving_order(image_urls)
+    has_video = _has_video(info) or any(_has_video(entry) for entry in entries)
+    is_image = bool(image_urls)
+    is_video = has_video or not is_image
+    return is_video, is_image, len(image_urls), image_urls
+
+
+def _has_video(info: dict[str, Any]) -> bool:
+    if info.get("duration"):
+        return True
+    formats = info.get("formats") or []
+    for item in formats:
+        if not isinstance(item, dict):
+            continue
+        vcodec = item.get("vcodec")
+        if vcodec and vcodec != "none":
+            return True
+        if item.get("height") and item.get("ext") not in _IMAGE_EXTENSIONS:
+            return True
+    ext = str(info.get("ext") or "").lower()
+    return bool(info.get("url") and ext and ext not in _IMAGE_EXTENSIONS)
+
+
+_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif"}
+
+
+def _image_url_from_info(info: dict[str, Any], *, allow_thumbnail_fallback: bool) -> str | None:
+    direct_url = info.get("url")
+    ext = str(info.get("ext") or "").lower()
+    if isinstance(direct_url, str) and (ext in _IMAGE_EXTENSIONS or info.get("vcodec") == "none"):
+        return direct_url
+
+    for key in ("image", "image_url", "display_url", "thumbnail"):
+        value = info.get(key)
+        if isinstance(value, str) and _looks_like_image_url(value):
+            return value
+
+    if allow_thumbnail_fallback:
+        thumbnails = [item for item in info.get("thumbnails") or [] if isinstance(item, dict)]
+        if thumbnails:
+            thumbnail = max(thumbnails, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0))
+            url = thumbnail.get("url")
+            if isinstance(url, str):
+                return url
+
+    return None
+
+
+def _looks_like_image_url(url: str) -> bool:
+    lower = url.lower().split("?", 1)[0]
+    return any(lower.endswith(f".{ext}") for ext in _IMAGE_EXTENSIONS)
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def variant_cache_key(
     metadata: VideoMetadata,
-    variant: DownloadVariant,
+    variant: DownloadVariant | ImageVariant,
     trim_range: TrimRange | None = None,
 ) -> str:
     key = f"{metadata.cache_key}:{variant.cache_suffix}"
@@ -198,6 +333,8 @@ class VideoDownloader:
         timeout_seconds: int = 600,
         metadata_timeout_seconds: int | None = None,
         cookies_file: Path | None = None,
+        x_cookies_file: Path | None = None,
+        instagram_cookies_file: Path | None = None,
         js_runtimes: str | None = None,
         remote_components: str | None = None,
         max_video_height: int = 480,
@@ -207,6 +344,8 @@ class VideoDownloader:
         self.timeout_seconds = timeout_seconds
         self.metadata_timeout_seconds = metadata_timeout_seconds or timeout_seconds
         self.cookies_file = cookies_file
+        self.x_cookies_file = x_cookies_file
+        self.instagram_cookies_file = instagram_cookies_file
         self.js_runtimes = js_runtimes
         self.remote_components = remote_components
         self.max_video_height = max_video_height
@@ -266,7 +405,7 @@ class VideoDownloader:
         try:
             return self._extract_metadata(url)
         except YtDlpDownloadError as exc:
-            raise DownloadError(_classify_yt_dlp_error(str(exc))) from exc
+            raise DownloadError(_classify_yt_dlp_error(str(exc), url)) from exc
 
     def _fetch_with_metadata_sync(
         self,
@@ -297,7 +436,7 @@ class VideoDownloader:
             )
         except YtDlpDownloadError as exc:
             shutil.rmtree(task_dir, ignore_errors=True)
-            raise DownloadError(_classify_yt_dlp_error(str(exc))) from exc
+            raise DownloadError(_classify_yt_dlp_error(str(exc), metadata.source_url)) from exc
         except subprocess.CalledProcessError as exc:
             LOGGER.warning("ffmpeg failed: %s", exc)
             raise DownloadError("No he podido convertir el video a un formato compatible.") from exc
@@ -312,8 +451,14 @@ class VideoDownloader:
         if task_dir.is_relative_to(self.download_dir):
             shutil.rmtree(task_dir, ignore_errors=True)
 
+    def cleanup_image_result(self, result: ImageResult) -> None:
+        parents = {path.parent for path in result.file_paths}
+        for task_dir in parents:
+            if task_dir.is_relative_to(self.download_dir):
+                shutil.rmtree(task_dir, ignore_errors=True)
+
     def _extract_metadata(self, url: str) -> VideoMetadata:
-        opts: dict[str, Any] = self._base_ydl_opts()
+        opts: dict[str, Any] = self._base_ydl_opts(url)
         opts.update({
             "quiet": True,
             "no_warnings": True,
@@ -333,7 +478,7 @@ class VideoDownloader:
         trim_range: TrimRange | None = None,
     ) -> Path:
         output_template = str(task_dir / "%(title).180B-%(id)s.%(ext)s")
-        opts: dict[str, Any] = self._base_ydl_opts()
+        opts: dict[str, Any] = self._base_ydl_opts(url)
         opts.update({
             "format": _format_selector(variant, self.max_video_height),
             "merge_output_format": "m4a" if variant.kind == "audio" else "mp4",
@@ -541,22 +686,152 @@ class VideoDownloader:
         ]
         subprocess.run(command, check=True, capture_output=True)
 
-    def _base_ydl_opts(self) -> dict[str, Any]:
+    def _base_ydl_opts(self, url: str | None = None) -> dict[str, Any]:
         opts: dict[str, Any] = {
             "logger": _YtDlpQuietLogger(),
             "no_color": True,
         }
-        if self.cookies_file:
-            opts["cookiefile"] = str(self.cookies_file)
+        if cookie_file := self._cookie_file_for_url(url):
+            opts["cookiefile"] = str(cookie_file)
         if self.js_runtimes:
             opts["js_runtimes"] = _parse_js_runtimes(self.js_runtimes)
         if self.remote_components:
             opts["remote_components"] = _parse_remote_components(self.remote_components)
         return opts
 
+    def _cookie_file_for_url(self, url: str | None) -> Path | None:
+        dedicated_file, platform, setting_name = _dedicated_cookie_config(
+            url,
+            self.x_cookies_file,
+            self.instagram_cookies_file,
+        )
+        if dedicated_file is None:
+            return self.cookies_file
+        if not dedicated_file.is_file() or not os.access(dedicated_file, os.R_OK):
+            raise DownloadError(
+                f"La sesion configurada para {platform} no esta disponible. "
+                f"Revisa o renueva {setting_name}."
+            )
+        return dedicated_file
 
-def _classify_yt_dlp_error(message: str) -> str:
+    # Image download methods
+    async def fetch_images(
+        self,
+        url: str,
+        *,
+        variant: ImageVariant | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> ImageResult:
+        """Fetch and download images from URL."""
+        metadata = await self.extract_metadata(url, progress=progress)
+        return await self.fetch_images_with_metadata(
+            metadata,
+            variant=variant,
+            progress=progress,
+        )
+
+    async def fetch_images_with_metadata(
+        self,
+        metadata: VideoMetadata,
+        *,
+        variant: ImageVariant | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> ImageResult:
+        """Fetch images with pre-extracted metadata."""
+        if not metadata.is_image or not metadata.image_urls:
+            raise DownloadError("El enlace no contiene imágenes")
+
+        selected_variant = variant or ImageVariant(quality="medium", count=1)
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                self._fetch_images_with_metadata_sync,
+                metadata,
+                selected_variant,
+                progress,
+            ),
+            timeout=self.timeout_seconds,
+        )
+
+    def _fetch_images_with_metadata_sync(
+        self,
+        metadata: VideoMetadata,
+        variant: ImageVariant,
+        progress: ProgressCallback | None = None,
+    ) -> ImageResult:
+        """Synchronous image fetching."""
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        task_dir = Path(tempfile.mkdtemp(prefix="images-", dir=self.download_dir))
+
+        try:
+            _report(progress, "Descargando imágenes", 25)
+
+            # Download and process images
+            downloaded = _download_images(
+                metadata.image_urls,
+                variant.count,
+                task_dir,
+                variant.quality,
+                self.max_upload_bytes,
+                cookie_file=self._cookie_file_for_url(metadata.source_url),
+            )
+
+            # Ensure images fit Telegram limits
+            sendable = self._ensure_sendable_images(downloaded, variant, progress)
+
+            return ImageResult(
+                file_paths=sendable,
+                metadata=metadata,
+                variant=variant,
+            )
+        except Exception as exc:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            if isinstance(exc, DownloadError):
+                raise
+            raise DownloadError(f"Error al descargar imágenes: {str(exc)}") from exc
+
+    def _ensure_sendable_images(
+        self,
+        image_paths: list[Path],
+        variant: ImageVariant,
+        progress: ProgressCallback | None = None,
+    ) -> list[Path]:
+        """Ensure images fit within Telegram's size limit."""
+        _report(progress, "Verificando tamaño", 75)
+        max_photo_bytes = min(self.max_upload_bytes, TELEGRAM_PHOTO_MAX_BYTES)
+        sendable_images: list[Path] = []
+        for img_path in image_paths:
+            if img_path.stat().st_size <= max_photo_bytes:
+                sendable_images.append(img_path)
+                continue
+
+            recompressed = _apply_image_quality(img_path, "low", max_photo_bytes)
+            if recompressed.stat().st_size > max_photo_bytes:
+                raise OversizeError("Una imagen sigue siendo demasiado grande para enviarla como foto.")
+            sendable_images.append(recompressed)
+            if recompressed != img_path and img_path.exists():
+                img_path.unlink()
+
+        _report(progress, "Listo", 95)
+        return sendable_images
+
+
+def _classify_yt_dlp_error(message: str, source_url: str | None = None) -> str:
     lower = message.lower()
+    platform = _cookie_platform_for_url(source_url)
+    authentication_markers = (
+        "authentication",
+        "auth_token",
+        "cookies",
+        "login",
+        "not authorized",
+        "sign in",
+        "unauthorized",
+    )
+    if platform == "X" and any(marker in lower for marker in authentication_markers):
+        return "X requiere una sesion valida para este enlace. Renueva YTDLP_X_COOKIES_FILE."
+    if platform == "Instagram" and any(marker in lower for marker in authentication_markers):
+        return "Instagram requiere una sesion valida para este enlace. Renueva YTDLP_INSTAGRAM_COOKIES_FILE."
+
     bot_markers = ("not a bot", "confirm you're not a bot", "confirm you’re not a bot")
     if any(marker in lower for marker in bot_markers):
         return (
@@ -574,6 +849,30 @@ def _classify_yt_dlp_error(message: str) -> str:
             "YTDLP_REMOTE_COMPONENTS=ejs:npm."
         )
     return "No he podido descargar ese enlace."
+
+
+def _dedicated_cookie_config(
+    url: str | None,
+    x_cookies_file: Path | None,
+    instagram_cookies_file: Path | None,
+) -> tuple[Path | None, str | None, str | None]:
+    platform = _cookie_platform_for_url(url)
+    if platform == "X":
+        return x_cookies_file, platform, "YTDLP_X_COOKIES_FILE"
+    if platform == "Instagram":
+        return instagram_cookies_file, platform, "YTDLP_INSTAGRAM_COOKIES_FILE"
+    return None, None, None
+
+
+def _cookie_platform_for_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    if host in {"x.com", "twitter.com"} or host.endswith((".x.com", ".twitter.com")):
+        return "X"
+    if host == "instagram.com" or host.endswith(".instagram.com"):
+        return "Instagram"
+    return None
 
 
 def _report(progress: ProgressCallback | None, label: str, percent: int) -> None:
@@ -688,3 +987,149 @@ def _download_progress_hook(progress: ProgressCallback | None) -> Callable[[dict
             progress("Procesando descarga", 65)
 
     return hook
+
+
+# Image handling functions
+
+def _download_image_from_url(
+    url: str,
+    save_path: Path,
+    cookie_jar: MozillaCookieJar | None = None,
+) -> None:
+    """Download a single image from URL and save to file."""
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        opener = (
+            urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+            if cookie_jar
+            else urllib.request
+        )
+        with opener.open(request, timeout=60) as response:
+            save_path.write_bytes(response.read())
+    except Exception as exc:
+        raise DownloadError(f"No se pudo descargar imagen: {str(exc)}") from exc
+
+
+def _apply_image_quality(
+    image_path: Path,
+    quality: str,
+    max_size_bytes: int,
+) -> Path:
+    """
+    Apply quality compression to an image. Returns path to compressed image.
+
+    Quality levels:
+    - 'high': JPEG quality 95, no downscaling
+    - 'medium': JPEG quality 80, downscale to 80% if needed for size
+    - 'low': JPEG quality 60, downscale to 60% if needed for size
+    """
+    try:
+        img = Image.open(image_path)
+
+        # Quality settings
+        quality_map = {
+            "high": {"quality": 95, "scale": 1.0},
+            "medium": {"quality": 80, "scale": 0.8},
+            "low": {"quality": 60, "scale": 0.6},
+        }
+        settings = quality_map.get(quality, quality_map["medium"])
+
+        # Convert RGBA/other formats to RGB for JPEG
+        if img.mode in ("RGBA", "LA", "P"):
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1] if img.mode == "RGBA" else None)
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        output_path = image_path.with_name(f"{image_path.stem}_compressed.jpg")
+        img.save(output_path, "JPEG", quality=settings["quality"], optimize=True)
+
+        # Check size and downscale if needed
+        current_size = output_path.stat().st_size
+        if current_size > max_size_bytes:
+            # Calculate scale factor needed
+            scale_factor = (max_size_bytes / current_size) ** 0.5
+            scale_factor = min(scale_factor, settings["scale"])
+
+            if scale_factor < 1.0:
+                new_width = max(1, int(img.width * scale_factor))
+                new_height = max(1, int(img.height * scale_factor))
+                img_scaled = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                img_scaled.save(output_path, "JPEG", quality=settings["quality"], optimize=True)
+
+        return output_path
+    except Exception as exc:
+        raise DownloadError(f"Error al procesar imagen: {str(exc)}") from exc
+
+
+def _download_images(
+    image_urls: list[str],
+    count: int,
+    task_dir: Path,
+    quality: str,
+    max_size_bytes: int,
+    *,
+    cookie_file: Path | None = None,
+) -> list[Path]:
+    """
+    Download and process multiple images.
+
+    Args:
+        image_urls: List of image URLs to download
+        count: Number of images to download (-1 for all, N for first N)
+        task_dir: Directory to save images
+        quality: Quality level ('high', 'medium', 'low')
+        max_size_bytes: Max size per image
+
+    Returns:
+        List of Path objects to downloaded and processed images
+    """
+    if not image_urls:
+        raise DownloadError("No hay imágenes disponibles para descargar")
+
+    # Determine how many to download
+    if count == -1:
+        target_count = len(image_urls)
+    else:
+        target_count = min(count, len(image_urls))
+
+    if target_count <= 0:
+        raise DownloadError("Número inválido de imágenes a descargar")
+
+    downloaded_images: list[Path] = []
+    cookie_jar = _load_cookie_jar(cookie_file) if cookie_file else None
+
+    for idx, url in enumerate(image_urls[:target_count]):
+        try:
+            temp_path = task_dir / f"image_{idx}.download"
+            if cookie_jar:
+                _download_image_from_url(url, temp_path, cookie_jar)
+            else:
+                _download_image_from_url(url, temp_path)
+
+            # Apply quality compression
+            processed_path = _apply_image_quality(temp_path, quality, max_size_bytes)
+            downloaded_images.append(processed_path)
+
+            # Clean up temp file if different
+            if processed_path != temp_path and temp_path.exists():
+                temp_path.unlink()
+        except DownloadError:
+            # Continue with next image instead of failing completely
+            LOGGER.warning(f"No se pudo descargar imagen {idx}: {url}")
+            continue
+
+    if not downloaded_images:
+        raise DownloadError("No se pudo descargar ninguna imagen")
+
+    return downloaded_images
+
+
+def _load_cookie_jar(cookie_file: Path) -> MozillaCookieJar:
+    cookie_jar = MozillaCookieJar(str(cookie_file))
+    try:
+        cookie_jar.load(ignore_discard=True, ignore_expires=True)
+    except OSError as exc:
+        raise DownloadError("No he podido leer las cookies configuradas para descargar imágenes.") from exc
+    return cookie_jar

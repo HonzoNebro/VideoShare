@@ -6,6 +6,20 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Content type constants
+CONTENT_TYPE_VIDEO = "video"
+CONTENT_TYPE_IMAGE = "image"
+CONTENT_TYPE_MIXED = "mixed"
+
+# Album selection options
+ALBUM_OPTION_FIRST = 1
+ALBUM_OPTION_ALL = -1
+
+# Image quality constants (same as video)
+IMAGE_QUALITY_HIGH = "high"
+IMAGE_QUALITY_MEDIUM = "medium"
+IMAGE_QUALITY_LOW = "low"
+
 
 def _parse_int_set(raw: str | None) -> set[int]:
     if not raw:
@@ -74,6 +88,8 @@ class Settings:
     telegram_write_timeout_seconds: float = 600.0
     telegram_pool_timeout_seconds: float = 30.0
     ytdlp_cookies_file: Path | None = None
+    ytdlp_x_cookies_file: Path | None = None
+    ytdlp_instagram_cookies_file: Path | None = None
     ytdlp_js_runtimes: str | None = None
     ytdlp_remote_components: str | None = None
 
@@ -129,6 +145,16 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         ytdlp_cookies_file=(
             Path(os.getenv("YTDLP_COOKIES_FILE", "")).expanduser()
             if os.getenv("YTDLP_COOKIES_FILE", "").strip()
+            else None
+        ),
+        ytdlp_x_cookies_file=(
+            Path(os.getenv("YTDLP_X_COOKIES_FILE", "")).expanduser()
+            if os.getenv("YTDLP_X_COOKIES_FILE", "").strip()
+            else None
+        ),
+        ytdlp_instagram_cookies_file=(
+            Path(os.getenv("YTDLP_INSTAGRAM_COOKIES_FILE", "")).expanduser()
+            if os.getenv("YTDLP_INSTAGRAM_COOKIES_FILE", "").strip()
             else None
         ),
         ytdlp_js_runtimes=os.getenv("YTDLP_JS_RUNTIMES", "").strip() or None,

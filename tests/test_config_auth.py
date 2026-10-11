@@ -74,6 +74,8 @@ def test_load_settings_parses_env_file(tmp_path: Path) -> None:
                 "TELEGRAM_WRITE_TIMEOUT_SECONDS=456",
                 "TELEGRAM_POOL_TIMEOUT_SECONDS=6",
                 f"YTDLP_COOKIES_FILE={tmp_path / 'cookies.txt'}",
+                f"YTDLP_X_COOKIES_FILE={tmp_path / 'cookies-x.txt'}",
+                f"YTDLP_INSTAGRAM_COOKIES_FILE={tmp_path / 'cookies-instagram.txt'}",
                 "YTDLP_JS_RUNTIMES=deno",
                 "YTDLP_REMOTE_COMPONENTS=ejs:npm",
                 "QUIET_UNAUTHORIZED=true",
@@ -109,6 +111,8 @@ def test_load_settings_parses_env_file(tmp_path: Path) -> None:
     assert settings.telegram_write_timeout_seconds == 456
     assert settings.telegram_pool_timeout_seconds == 6
     assert settings.ytdlp_cookies_file == tmp_path / "cookies.txt"
+    assert settings.ytdlp_x_cookies_file == tmp_path / "cookies-x.txt"
+    assert settings.ytdlp_instagram_cookies_file == tmp_path / "cookies-instagram.txt"
     assert settings.ytdlp_js_runtimes == "deno"
     assert settings.ytdlp_remote_components == "ejs:npm"
     assert settings.quiet_unauthorized is True

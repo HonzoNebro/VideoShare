@@ -6,12 +6,13 @@ from telegram.constants import ChatType
 from telegram.error import BadRequest
 
 from bot.config import Settings
-from bot.downloader import DownloadVariant, OversizeError, TrimRange, VideoMetadata
+from bot.downloader import DownloadVariant, ImageResult, ImageVariant, OversizeError, TrimRange, VideoMetadata
 from bot.handlers import (
     BotServices,
     PendingSelection,
     PendingTrimRequest,
     SendTarget,
+    _album_option_keyboard,
     _caption_for_chat,
     _cache_sent_message,
     _error_report_text,
@@ -19,6 +20,7 @@ from bot.handlers import (
     _is_update_allowed,
     _kind_keyboard,
     _process_variant_selection,
+    _send_image_result,
     _is_message_not_modified,
     _quality_keyboard,
     _validate_selection_limits,
@@ -239,6 +241,18 @@ def test_variant_keyboards_use_short_callback_data() -> None:
     ]
 
 
+def test_album_keyboard_only_offers_first_or_all() -> None:
+    keyboard = _album_option_keyboard("abc123")
+    buttons = [row[0] for row in keyboard.inline_keyboard]
+
+    assert [button.text for button in buttons] == ["Primera", "Todas"]
+    assert [button.callback_data for button in buttons] == [
+        "vs:abc123:album:1",
+        "vs:abc123:album:-1",
+    ]
+    assert all(len(str(button.callback_data)) <= 64 for button in buttons)
+
+
 def test_cache_sent_message_stores_variant_cache_key(tmp_path) -> None:
     from bot.cache import VideoCache
 
@@ -252,6 +266,76 @@ def test_cache_sent_message_stores_variant_cache_key(tmp_path) -> None:
     assert entry is not None
     assert entry.media_type == "audio"
     assert entry.file_id == "audio-file"
+
+
+async def test_send_image_result_uses_send_photo_for_single_image(tmp_path) -> None:
+    from bot.cache import VideoCache
+
+    image_path = tmp_path / "one.jpg"
+    image_path.write_bytes(b"image")
+    calls: list[dict[str, object]] = []
+
+    async def send_photo(**kwargs: object):
+        calls.append(kwargs)
+        return SimpleNamespace(photo=[SimpleNamespace(file_id="photo-file", file_unique_id="unique")])
+
+    services = SimpleNamespace(
+        settings=_settings(caption_mode_private="none"),
+        cache=VideoCache(tmp_path / "cache.sqlite3"),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_photo=send_photo))
+    result = ImageResult([image_path], _metadata(), ImageVariant("medium", 1))
+
+    await _send_image_result(
+        context,
+        services,
+        result,
+        SendTarget(chat_id=123, chat_type=ChatType.PRIVATE, reply_to_message_id=99),
+    )
+
+    assert calls[0]["chat_id"] == 123
+    assert calls[0]["reply_to_message_id"] == 99
+    assert services.cache.get("example:id:image-medium-count1").media_type == "photo"  # type: ignore[union-attr]
+
+
+async def test_send_image_result_uses_media_group_for_album(tmp_path) -> None:
+    from bot.cache import VideoCache
+
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"{index}.jpg"
+        path.write_bytes(b"image")
+        paths.append(path)
+    media_groups: list[dict[str, object]] = []
+
+    async def send_media_group(**kwargs: object):
+        media_groups.append(kwargs)
+        return [
+            SimpleNamespace(photo=[SimpleNamespace(file_id="photo-1", file_unique_id="unique-1")]),
+            SimpleNamespace(photo=[SimpleNamespace(file_id="photo-2", file_unique_id="unique-2")]),
+        ]
+
+    services = SimpleNamespace(
+        settings=_settings(caption_mode_private="full"),
+        cache=VideoCache(tmp_path / "cache.sqlite3"),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(send_media_group=send_media_group))
+    result = ImageResult(paths, _metadata(), ImageVariant("medium", -1))
+
+    await _send_image_result(
+        context,
+        services,
+        result,
+        SendTarget(chat_id=123, chat_type=ChatType.PRIVATE, reply_to_message_id=99),
+    )
+
+    media = media_groups[0]["media"]
+    assert len(media) == 2
+    assert media[0].caption is not None
+    assert media[1].caption is None
+    entry = services.cache.get("example:id:image-medium-countall")
+    assert entry is not None
+    assert services.cache.album_file_ids(entry) == ["photo-1", "photo-2"]
 
 
 async def test_callback_with_expired_token_warns_user(monkeypatch) -> None:
@@ -391,6 +475,39 @@ async def test_send_cached_audio_uses_send_audio() -> None:
         "parse_mode": None,
         "reply_to_message_id": 99,
     }]
+
+
+async def test_send_cached_photo_album_uses_file_ids(tmp_path) -> None:
+    from bot.handlers import _send_cached
+    from bot.cache import VideoCache
+
+    media_groups: list[dict[str, object]] = []
+
+    async def send_media_group(**kwargs: object) -> None:
+        media_groups.append(kwargs)
+
+    cache = VideoCache(tmp_path / "cache.sqlite3")
+    cache.put_album(
+        cache_key="example:id:image-medium-countall",
+        file_ids=["photo-1", "photo-2"],
+    )
+    entry = cache.get("example:id:image-medium-countall")
+    assert entry is not None
+
+    context = SimpleNamespace(bot=SimpleNamespace(send_media_group=send_media_group))
+    services = SimpleNamespace(settings=_settings(caption_mode_private="none"), cache=cache)
+
+    await _send_cached(
+        context,
+        services,
+        _metadata(),
+        SendTarget(chat_id=123, chat_type=ChatType.PRIVATE, reply_to_message_id=99),
+        entry,
+    )
+
+    assert media_groups[0]["chat_id"] == 123
+    assert media_groups[0]["reply_to_message_id"] == 99
+    assert [item.media for item in media_groups[0]["media"]] == ["photo-1", "photo-2"]
 
 
 async def test_successful_cached_selection_deletes_progress_message(monkeypatch) -> None:

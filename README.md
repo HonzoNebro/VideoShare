@@ -1,6 +1,6 @@
 # VideoShare Bot
 
-Bot de Telegram para recibir enlaces publicos de video, descargarlos con `yt-dlp` y devolverlos como video nativo con titulo, descripcion y enlace original.
+Bot de Telegram para recibir enlaces publicos de video o imagenes, descargarlos con `yt-dlp` y devolverlos como contenido nativo con titulo, descripcion y enlace original.
 
 ## Requisitos
 
@@ -118,8 +118,8 @@ Para que el bot lea mensajes normales en grupos, revisa en BotFather:
 ```
 
 Mientras trabaja, el bot edita un unico mensaje de estado con una barra sencilla de progreso.
-Tras leer cada enlace, muestra botones para elegir `Video` o `Audio` y despues `Alta`, `Media` o `Baja`.
-Si otro video se esta procesando, el siguiente queda en cola y el mensaje de estado lo indica.
+Tras leer cada enlace, muestra botones para elegir `Video` o `Audio` y despues `Alta`, `Media` o `Baja`. Si el enlace contiene imagenes, permite elegir `Primera` o `Todas` y la calidad de imagen. Si contiene video e imagenes, primero pregunta que tipo descargar.
+Si otro contenido pesado se esta procesando, el siguiente queda en cola y el mensaje de estado lo indica.
 Las actualizaciones de progreso no criticas se limitan por defecto a una cada 10 segundos.
 
 Comandos utiles:
@@ -134,14 +134,16 @@ Comandos utiles:
 ## Comportamiento
 
 - Soporta enlaces publicos de sitios admitidos por `yt-dlp`.
-- No usa cookies ni cuentas de terceros.
+- Puede usar sesiones dedicadas de X e Instagram para contenido publico bloqueado tras inicio de sesion.
 - Permite elegir video o solo audio y tres niveles de calidad por enlace.
+- Permite descargar imagenes individuales y albumes/carruseles como fotos nativas de Telegram.
 - Permite recortar video o audio indicando un rango `MM:SS.cc-MM:SS.cc`.
 - Intenta producir MP4 para video y M4A/MP3 para audio.
+- Convierte y recomprime imagenes con Pillow cuando hace falta para que Telegram las acepte como foto.
 - Si el archivo supera `MAX_UPLOAD_MB`, intenta reducir calidad con `ffmpeg`.
 - Si no puede reducirlo lo suficiente, devuelve un aviso y el enlace original.
-- Cachea durante 30 dias el `file_id` devuelto por Telegram para reenviar copias de la misma variante sin descargarla ni recomprimirla de nuevo.
-- Un mismo enlace puede tener entradas separadas para `video-high`, `video-medium`, `video-low`, `audio-high`, `audio-medium` y `audio-low`; solo se crean cuando alguien pide esa variante.
+- Cachea durante 30 dias el `file_id` devuelto por Telegram para reenviar copias de la misma variante sin descargarla ni recomprimirla de nuevo. Los albumes guardan la lista ordenada de `file_id`.
+- Un mismo enlace puede tener entradas separadas para `video-high`, `video-medium`, `video-low`, `audio-high`, `audio-medium`, `audio-low`, `image-*-count1` e `image-*-countall`; solo se crean cuando alguien pide esa variante.
 - Mantiene alias de URL normalizadas para vincular enlaces repetidos con la clave base del video.
 - Recuerda durante el mismo TTL los videos rechazados por duracion o tamano estimado para no volver a procesarlos.
 - No guarda videos procesados de forma permanente; la cache por defecto es SQLite en `DOWNLOAD_DIR/cache.sqlite3`.
@@ -185,3 +187,22 @@ YTDLP_REMOTE_COMPONENTS=ejs:npm
 
 Despues reinicia el bot. No compartas ese archivo: equivale a una sesion del navegador.
 Para YouTube moderno, instala tambien un runtime JavaScript compatible. Deno 2+ es el recomendado por `yt-dlp`.
+
+### Sesiones dedicadas de X e Instagram
+
+Para enlaces publicos que X o Instagram obligan a abrir con sesion, usa cuentas tecnicas dedicadas y exporta las cookies de cada dominio por separado, en formato Netscape:
+
+```env
+YTDLP_X_COOKIES_FILE=/opt/videoshare-bot/cookies-x.txt
+YTDLP_INSTAGRAM_COOKIES_FILE=/opt/videoshare-bot/cookies-instagram.txt
+```
+
+Las cookies especificas tienen prioridad sobre `YTDLP_COOKIES_FILE`. Si una de ellas esta configurada pero no puede leerse, el bot avisa para renovarla y no prueba otra cuenta. Esta opcion solo permite acceder al contenido que la cuenta dedicada puede ver legitimamente; no habilita contenido privado ni evita restricciones de la plataforma.
+
+Protege los archivos y no los añadas a Git:
+
+```bash
+chmod 600 /opt/videoshare-bot/cookies-x.txt /opt/videoshare-bot/cookies-instagram.txt
+```
+
+Cuando caduque una sesion, reemplaza solo el archivo de esa plataforma y reinicia el servicio.

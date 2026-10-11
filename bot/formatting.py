@@ -79,3 +79,59 @@ def build_caption(
         uploader=uploader,
         max_description_chars=compact_description_limit,
     )
+
+
+def build_image_caption(
+    *,
+    title: str | None,
+    description: str | None,
+    source_url: str,
+    uploader: str | None = None,
+    image_number: int | None = None,
+    total_images: int | None = None,
+    max_description_chars: int = 650,
+) -> str:
+    """Build caption for image, optionally with album info."""
+    lines: list[str] = []
+
+    # Add title
+    if title:
+        lines.append(f"<b>{escape(truncate_text(title, 160))}</b>")
+
+    # Add uploader
+    if uploader:
+        lines.append(escape(truncate_text(uploader, 80)))
+
+    # Add album info if applicable
+    if image_number is not None and total_images is not None:
+        lines.append(f"🖼️ Imagen {image_number} de {total_images}")
+
+    # Add description
+    short_description = truncate_text(description, max_description_chars)
+    if short_description:
+        lines.append("")
+        lines.append(escape(short_description))
+
+    # Add original link
+    lines.append("")
+    lines.append(f'<a href="{escape(source_url, quote=True)}">Enlace original</a>')
+
+    caption = "\n".join(lines).strip()
+    if len(caption) <= CAPTION_LIMIT:
+        return caption
+
+    # If too long, try reducing description
+    reserved = len(f'\n\n<a href="{escape(source_url, quote=True)}">Enlace original</a>')
+    if image_number is not None:
+        reserved += len(f"\n🖼️ Imagen {image_number} de {total_images}")
+
+    compact_description_limit = max(0, CAPTION_LIMIT - reserved - 260)
+    return build_image_caption(
+        title=title,
+        description=description,
+        source_url=source_url,
+        uploader=uploader,
+        image_number=image_number,
+        total_images=total_images,
+        max_description_chars=compact_description_limit,
+    )

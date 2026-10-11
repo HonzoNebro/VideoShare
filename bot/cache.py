@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import sqlite3
 import time
@@ -119,6 +120,40 @@ class VideoCache:
                     now,
                 ),
             )
+
+    def put_album(
+        self,
+        *,
+        cache_key: str,
+        file_ids: list[str],
+        title: str | None = None,
+        description: str | None = None,
+        webpage_url: str | None = None,
+        uploader: str | None = None,
+    ) -> None:
+        if not file_ids:
+            return
+        self.put(
+            cache_key=cache_key,
+            media_type="photo_album",
+            file_id=json.dumps(file_ids),
+            file_unique_id=None,
+            title=title,
+            description=description,
+            webpage_url=webpage_url,
+            uploader=uploader,
+        )
+
+    def album_file_ids(self, entry: CacheEntry) -> list[str]:
+        if entry.media_type != "photo_album":
+            return []
+        try:
+            raw = json.loads(entry.file_id)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [item for item in raw if isinstance(item, str) and item]
 
     def delete(self, cache_key: str) -> None:
         with self._connect() as conn:

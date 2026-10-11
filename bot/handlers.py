@@ -13,16 +13,24 @@ import traceback
 from telegram import Update
 from telegram import Message
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InputMediaPhoto
 from telegram.constants import ChatAction, ChatType, ParseMode
 from telegram.error import TelegramError, TimedOut
 from telegram.ext import ContextTypes
 
 from bot.auth import is_group_allowed, is_private_allowed
 from bot.cache import CacheEntry, VideoCache
-from bot.config import Settings
+from bot.config import (
+    Settings,
+    CONTENT_TYPE_VIDEO,
+    CONTENT_TYPE_IMAGE,
+    CONTENT_TYPE_MIXED,
+)
 from bot.downloader import (
     DownloadError,
     DownloadVariant,
+    ImageVariant,
+    ImageResult,
     OversizeError,
     TrimRange,
     VideoDownloader,
@@ -57,6 +65,8 @@ class PendingSelection:
     target: SendTarget
     created_at: float
     trim_range: TrimRange | None = None
+    content_type: str = CONTENT_TYPE_VIDEO  # 'video', 'image', or 'mixed'
+    selected_album_option: int | None = None
 
 
 @dataclass(frozen=True)
@@ -109,7 +119,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.effective_message.reply_text(
-        "Enviame un enlace publico de video y te lo devolvere listo para compartir."
+        "Enviame un enlace publico de video o imagenes y te lo devolvere listo para compartir."
     )
 
 
@@ -195,6 +205,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             services.cache.put_alias(normalized_url=normalized_url, cache_key=metadata.cache_key)
             if not update.effective_chat:
                 continue
+            # Determine content type
+            content_type = _determine_content_type(metadata)
+
             token = _create_pending_selection(
                 services,
                 source_url=url,
@@ -205,11 +218,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     chat_type=update.effective_chat.type,
                     reply_to_message_id=message.message_id,
                 ),
+                content_type=content_type,
             )
             await progress.update("Esperando seleccion", 100, force=True)
             await message.reply_text(
-                _selection_text(metadata, url),
-                reply_markup=_kind_keyboard(token),
+                _selection_text(metadata, url, content_type),
+                reply_markup=_kind_keyboard(token, content_type),
                 disable_web_page_preview=True,
             )
         except asyncio.TimeoutError:
@@ -256,6 +270,68 @@ async def handle_variant_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     await query.answer()
+
+    # Handle content type selection for mixed content.
+    if action == "content" and len(parts) == 4:
+        content_choice = parts[3]
+        if content_choice not in {"video", "image"}:
+            return
+
+        services.pending_selections[token] = replace(pending, content_type=content_choice)
+
+        if content_choice == "video":
+            # Show video kind selection
+            await _edit_query_message(
+                query.message,
+                _selection_text(pending.metadata, pending.source_url, CONTENT_TYPE_VIDEO),
+                reply_markup=_kind_keyboard(token, CONTENT_TYPE_VIDEO),
+            )
+        elif content_choice == "image":
+            # Show album option selection
+            await _edit_query_message(
+                query.message,
+                _album_option_text(pending.metadata),
+                reply_markup=_album_option_keyboard(token),
+            )
+        return
+
+    # Handle album quantity selection
+    if action == "album" and len(parts) == 4:
+        try:
+            count = int(parts[3])
+            if count not in {1, -1}:
+                return
+        except ValueError:
+            return
+
+        services.pending_selections[token] = replace(pending, selected_album_option=count)
+
+        # Show image quality selection
+        await _edit_query_message(
+            query.message,
+            _image_quality_text(pending.metadata, _selected_image_count(pending.metadata, count)),
+            reply_markup=_image_quality_keyboard(token),
+        )
+        return
+
+    # Handle image quality selection
+    if action == "image_quality" and len(parts) == 4:
+        quality = parts[3]
+        if quality not in {"high", "medium", "low"}:
+            return
+
+        # Get updated pending with album option
+        pending = services.pending_selections.pop(token, pending)
+        album_count = pending.selected_album_option or 1
+
+        try:
+            variant = ImageVariant(quality=quality, count=album_count)
+        except ValueError:
+            return
+
+        await _process_image_selection(update, context, services, pending, variant)
+        return
+
     if action == "kind" and len(parts) == 4:
         kind = parts[3]
         if kind not in {"video", "audio"}:
@@ -444,6 +520,125 @@ async def _process_variant_selection(
             services.downloader.cleanup_result(result)
 
 
+async def _process_image_selection(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    services: BotServices,
+    pending: PendingSelection,
+    variant: ImageVariant,
+) -> None:
+    """Process image download selection similar to _process_variant_selection but for images."""
+    status = update.effective_message
+    if not status:
+        return
+
+    result: ImageResult | None = None
+    progress = ProgressEditor(
+        status,
+        1,
+        1,
+        edit_interval_seconds=services.settings.progress_update_interval_seconds,
+    )
+    cache_key = variant_cache_key(pending.metadata, variant)
+    timeout_message = "La operacion ha tardado demasiado y se ha cancelado."
+    try:
+        await progress.update("Preparando seleccion", 5, force=True)
+        # No need to validate duration limits for images
+        rejected = services.cache.get_rejection(cache_key)
+        if rejected:
+            await progress.update("Rechazado desde cache", 100, force=True)
+            await context.bot.send_message(
+                chat_id=pending.target.chat_id,
+                text=f"{rejected.message}\n\n{pending.source_url}",
+                reply_to_message_id=pending.target.reply_to_message_id,
+            )
+            return
+
+        async with services.cache_key_lock(cache_key):
+            cached = services.cache.get(cache_key)
+            if cached:
+                await progress.update("Enviando desde cache", 90, force=True)
+                try:
+                    await _send_cached(context, services, pending.metadata, pending.target, cached)
+                    await _safe_delete_status(status)
+                    return
+                except (TelegramError, ValueError):
+                    LOGGER.info("Cached Telegram image file_id failed, deleting cache entry", exc_info=True)
+                    services.cache.delete(cache_key)
+
+            await _acquire_job_slot(services, progress)
+            try:
+                await context.bot.send_chat_action(
+                    chat_id=pending.target.chat_id,
+                    action=ChatAction.UPLOAD_PHOTO,
+                )
+                await progress.update("Procesando", 20, force=True)
+                timeout_message = "La descarga ha tardado demasiado y se ha cancelado."
+                result = await services.downloader.fetch_images_with_metadata(
+                    pending.metadata,
+                    variant=variant,
+                    progress=progress.threadsafe_update,
+                )
+                await progress.update("Subiendo a Telegram", 85, force=True)
+                timeout_message = "La subida a Telegram ha tardado demasiado y se ha cancelado."
+                await asyncio.wait_for(
+                    _send_image_result(context, services, result, pending.target),
+                    timeout=services.settings.upload_timeout_seconds,
+                )
+                await _safe_delete_status(status)
+            finally:
+                _release_job_slot(services)
+    except asyncio.TimeoutError:
+        await context.bot.send_message(
+            chat_id=pending.target.chat_id,
+            text=timeout_message,
+            reply_to_message_id=pending.target.reply_to_message_id,
+        )
+    except OversizeError as exc:
+        services.cache.put_rejection(
+            cache_key=cache_key,
+            message=str(exc),
+            **_metadata_cache_fields(pending.metadata),
+        )
+        await context.bot.send_message(
+            chat_id=pending.target.chat_id,
+            text=f"{exc}\n\n{pending.source_url}",
+            reply_to_message_id=pending.target.reply_to_message_id,
+        )
+    except DownloadError as exc:
+        await context.bot.send_message(
+            chat_id=pending.target.chat_id,
+            text=str(exc),
+            reply_to_message_id=pending.target.reply_to_message_id,
+        )
+    except TelegramError as exc:
+        if _is_message_not_modified(exc):
+            LOGGER.debug("Ignoring Telegram no-op message edit", exc_info=True)
+            return
+        LOGGER.exception("Telegram failed while sending %s", pending.source_url)
+        await _notify_admin_error(
+            context,
+            services,
+            update,
+            pending.source_url,
+            exc,
+            "Error de Telegram",
+        )
+    except Exception as exc:
+        LOGGER.exception("Unexpected error while processing %s", pending.source_url)
+        await _notify_admin_error(
+            context,
+            services,
+            update,
+            pending.source_url,
+            exc,
+            "Error inesperado",
+        )
+    finally:
+        if result:
+            services.downloader.cleanup_image_result(result)
+
+
 async def _send_result(
     context: ContextTypes.DEFAULT_TYPE,
     services: BotServices,
@@ -504,6 +699,155 @@ async def _send_result(
         _cache_sent_message(services, result.metadata, result.variant, sent, result.trim_range)
 
 
+async def _send_image_result(
+    context: ContextTypes.DEFAULT_TYPE,
+    services: BotServices,
+    result: ImageResult,
+    target: SendTarget,
+) -> None:
+    """Send downloaded images to Telegram using media_group for multiple images."""
+    caption = _caption_for_target(result.metadata, services, target)
+    parse_mode = ParseMode.HTML if caption else None
+
+    # If single image, use send_photo
+    if len(result.file_paths) == 1:
+        with result.file_paths[0].open("rb") as photo:
+            try:
+                sent = await context.bot.send_photo(
+                    chat_id=target.chat_id,
+                    photo=photo,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=target.reply_to_message_id,
+                )
+                _cache_sent_photo(services, result.metadata, result.variant, sent)
+                return
+            except TelegramError:
+                LOGGER.info("send_photo failed, trying send_document", exc_info=True)
+                photo.seek(0)
+                sent = await context.bot.send_document(
+                    chat_id=target.chat_id,
+                    document=photo,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=target.reply_to_message_id,
+                )
+                _cache_sent_image_document(services, result.metadata, result.variant, sent)
+                return
+
+    sent_messages: list[object] = []
+    try:
+        sent_messages = await _send_photo_album_from_paths(
+            context,
+            result.file_paths,
+            target,
+            caption=caption,
+            parse_mode=parse_mode,
+        )
+    except TelegramError as exc:
+        LOGGER.info("send_media_group failed: %s", exc, exc_info=True)
+        for idx, img_path in enumerate(result.file_paths):
+            with img_path.open("rb") as photo:
+                img_caption = caption if idx == 0 else None
+                sent = await context.bot.send_photo(
+                    chat_id=target.chat_id,
+                    photo=photo,
+                    caption=img_caption,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=target.reply_to_message_id if idx == 0 else None,
+                )
+                sent_messages.append(sent)
+
+    _cache_sent_photo_album(services, result.metadata, result.variant, sent_messages)
+
+
+async def _send_photo_album_from_paths(
+    context: ContextTypes.DEFAULT_TYPE,
+    file_paths: list[Path],
+    target: SendTarget,
+    *,
+    caption: str | None,
+    parse_mode: str | None,
+) -> list[object]:
+    sent_messages: list[object] = []
+    caption_used = False
+    for chunk_index, chunk in enumerate(_chunks(file_paths, 10)):
+        opened = [path.open("rb") for path in chunk]
+        try:
+            if len(opened) == 1:
+                sent = await context.bot.send_photo(
+                    chat_id=target.chat_id,
+                    photo=opened[0],
+                    caption=caption if not caption_used else None,
+                    parse_mode=parse_mode if not caption_used else None,
+                    reply_to_message_id=target.reply_to_message_id if chunk_index == 0 else None,
+                )
+                sent_messages.append(sent)
+                caption_used = True
+                continue
+
+            media = [
+                InputMediaPhoto(
+                    photo,
+                    caption=caption if not caption_used and index == 0 else None,
+                    parse_mode=parse_mode if not caption_used and index == 0 else None,
+                )
+                for index, photo in enumerate(opened)
+            ]
+            sent = await context.bot.send_media_group(
+                chat_id=target.chat_id,
+                media=media,
+                reply_to_message_id=target.reply_to_message_id if chunk_index == 0 else None,
+            )
+            sent_messages.extend(sent)
+            caption_used = True
+        finally:
+            for photo in opened:
+                photo.close()
+    return sent_messages
+
+
+async def _send_cached_photo_album(
+    context: ContextTypes.DEFAULT_TYPE,
+    file_ids: list[str],
+    target: SendTarget,
+    *,
+    caption: str | None,
+    parse_mode: str | None,
+) -> None:
+    caption_used = False
+    for chunk_index, chunk in enumerate(_chunks(file_ids, 10)):
+        if len(chunk) == 1:
+            await context.bot.send_photo(
+                chat_id=target.chat_id,
+                photo=chunk[0],
+                caption=caption if not caption_used else None,
+                parse_mode=parse_mode if not caption_used else None,
+                reply_to_message_id=target.reply_to_message_id if chunk_index == 0 else None,
+            )
+            caption_used = True
+            continue
+
+        media = [
+            InputMediaPhoto(
+                file_id,
+                caption=caption if not caption_used and index == 0 else None,
+                parse_mode=parse_mode if not caption_used and index == 0 else None,
+            )
+            for index, file_id in enumerate(chunk)
+        ]
+        await context.bot.send_media_group(
+            chat_id=target.chat_id,
+            media=media,
+            reply_to_message_id=target.reply_to_message_id if chunk_index == 0 else None,
+        )
+        caption_used = True
+
+
+def _chunks(values: list, size: int) -> list[list]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
 async def _send_cached(
     context: ContextTypes.DEFAULT_TYPE,
     services: BotServices,
@@ -513,6 +857,29 @@ async def _send_cached(
 ) -> None:
     caption = _caption_for_target(metadata, services, target)
     parse_mode = ParseMode.HTML if caption else None
+    if entry.media_type == "photo":
+        await context.bot.send_photo(
+            chat_id=target.chat_id,
+            photo=entry.file_id,
+            caption=caption,
+            parse_mode=parse_mode,
+            reply_to_message_id=target.reply_to_message_id,
+        )
+        return
+
+    if entry.media_type == "photo_album":
+        file_ids = services.cache.album_file_ids(entry)
+        if not file_ids:
+            raise ValueError("Cached photo album has no file ids")
+        await _send_cached_photo_album(
+            context,
+            file_ids,
+            target,
+            caption=caption,
+            parse_mode=parse_mode,
+        )
+        return
+
     if entry.media_type == "audio":
         await context.bot.send_audio(
             chat_id=target.chat_id,
@@ -546,7 +913,7 @@ async def _send_cached(
 def cleanup_download_dir(download_dir: Path) -> None:
     download_dir.mkdir(parents=True, exist_ok=True)
     for child in download_dir.iterdir():
-        if child.is_dir() and child.name.startswith("video-"):
+        if child.is_dir() and (child.name.startswith("video-") or child.name.startswith("images-")):
             shutil.rmtree(child, ignore_errors=True)
 
 
@@ -635,6 +1002,7 @@ def _create_pending_selection(
     normalized_url: str,
     metadata: VideoMetadata,
     target: SendTarget,
+    content_type: str = CONTENT_TYPE_VIDEO,
 ) -> str:
     _prune_pending_selections(services)
     token = secrets.token_urlsafe(6)
@@ -644,6 +1012,7 @@ def _create_pending_selection(
         metadata=metadata,
         target=target,
         created_at=time.time(),
+        content_type=content_type,
     )
     return token
 
@@ -670,11 +1039,44 @@ def _prune_pending_trim_requests(services: BotServices, ttl_seconds: int = 3600)
         services.pending_trim_requests.pop(key, None)
 
 
-def _kind_keyboard(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Video", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:video"),
-        InlineKeyboardButton("Audio", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:audio"),
-    ]])
+def _kind_keyboard(token: str, content_type: str = None) -> InlineKeyboardMarkup:
+    """Show appropriate keyboard based on content type."""
+    if content_type is None:
+        # Try to get from pending selection if available
+        content_type = CONTENT_TYPE_VIDEO  # Default fallback
+
+    if content_type == CONTENT_TYPE_VIDEO:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("Video", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:video"),
+            InlineKeyboardButton("Audio", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:audio"),
+        ]])
+    elif content_type == CONTENT_TYPE_IMAGE:
+        return _album_option_keyboard(token)
+    elif content_type == CONTENT_TYPE_MIXED:
+        return _content_type_keyboard(token)
+    else:
+        # Fallback to video keyboard
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("Video", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:video"),
+            InlineKeyboardButton("Audio", callback_data=f"{CALLBACK_PREFIX}:{token}:kind:audio"),
+        ]])
+
+
+def _selection_text(metadata: VideoMetadata, source_url: str, content_type: str = None) -> str:
+    """Show appropriate selection text based on content type."""
+    if content_type is None:
+        content_type = _determine_content_type(metadata)
+
+    if content_type == CONTENT_TYPE_VIDEO:
+        title = metadata.title or "Enlace detectado"
+        return f"{title}\n\nElige formato para procesar este enlace:\n{source_url}"
+    elif content_type == CONTENT_TYPE_IMAGE:
+        return _album_option_text(metadata)
+    elif content_type == CONTENT_TYPE_MIXED:
+        return _content_type_text(metadata, source_url)
+    else:
+        title = metadata.title or "Enlace detectado"
+        return f"{title}\n\nElige formato:\n{source_url}"
 
 
 def _quality_keyboard(
@@ -703,11 +1105,6 @@ def _trim_cancel_keyboard(token: str, kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Sin recorte", callback_data=f"{CALLBACK_PREFIX}:{token}:untrim:{kind}"),
     ]])
-
-
-def _selection_text(metadata: VideoMetadata, source_url: str) -> str:
-    title = metadata.title or "Enlace detectado"
-    return f"{title}\n\nElige formato para procesar este enlace:\n{source_url}"
 
 
 def _quality_text(
@@ -882,6 +1279,69 @@ def _cache_sent_message(
         )
 
 
+def _cache_sent_photo(
+    services: BotServices,
+    metadata: VideoMetadata,
+    variant: ImageVariant,
+    sent_message: object,
+) -> None:
+    photos = getattr(sent_message, "photo", None)
+    if not photos:
+        return
+    photo = photos[-1]
+    file_id = getattr(photo, "file_id", None)
+    if not file_id:
+        return
+    services.cache.put(
+        cache_key=variant_cache_key(metadata, variant),
+        media_type="photo",
+        file_id=file_id,
+        file_unique_id=getattr(photo, "file_unique_id", None),
+        **_metadata_cache_fields(metadata),
+    )
+
+
+def _cache_sent_photo_album(
+    services: BotServices,
+    metadata: VideoMetadata,
+    variant: ImageVariant,
+    sent_messages: list[object],
+) -> None:
+    file_ids: list[str] = []
+    for message in sent_messages:
+        photos = getattr(message, "photo", None)
+        if not photos:
+            continue
+        file_id = getattr(photos[-1], "file_id", None)
+        if file_id:
+            file_ids.append(file_id)
+    if len(file_ids) != len(sent_messages):
+        return
+    services.cache.put_album(
+        cache_key=variant_cache_key(metadata, variant),
+        file_ids=file_ids,
+        **_metadata_cache_fields(metadata),
+    )
+
+
+def _cache_sent_image_document(
+    services: BotServices,
+    metadata: VideoMetadata,
+    variant: ImageVariant,
+    sent_message: object,
+) -> None:
+    document = getattr(sent_message, "document", None)
+    if not document or not getattr(document, "file_id", None):
+        return
+    services.cache.put(
+        cache_key=variant_cache_key(metadata, variant),
+        media_type="document",
+        file_id=document.file_id,
+        file_unique_id=getattr(document, "file_unique_id", None),
+        **_metadata_cache_fields(metadata),
+    )
+
+
 def _metadata_cache_fields(metadata: VideoMetadata) -> dict[str, str | None]:
     return {
         "title": metadata.title,
@@ -1039,3 +1499,75 @@ def _truncate_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 15].rstrip() + "\n...[truncado]"
+
+
+# Image handling functions
+
+def _determine_content_type(metadata: VideoMetadata) -> str:
+    """Determine content type: video, image, or mixed."""
+    if metadata.is_video and metadata.is_image:
+        return CONTENT_TYPE_MIXED
+    if metadata.is_image:
+        return CONTENT_TYPE_IMAGE
+    return CONTENT_TYPE_VIDEO
+
+
+def _content_type_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Show keyboard for choosing content type."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Video", callback_data=f"{CALLBACK_PREFIX}:{token}:content:video"),
+        InlineKeyboardButton("Imagenes", callback_data=f"{CALLBACK_PREFIX}:{token}:content:image"),
+    ]])
+
+
+def _album_option_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Show keyboard for choosing how many images to download."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Primera", callback_data=f"{CALLBACK_PREFIX}:{token}:album:1")],
+        [InlineKeyboardButton("Todas", callback_data=f"{CALLBACK_PREFIX}:{token}:album:-1")],
+    ])
+
+
+def _image_quality_keyboard(token: str) -> InlineKeyboardMarkup:
+    """Show keyboard for choosing image quality."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Alta", callback_data=f"{CALLBACK_PREFIX}:{token}:image_quality:high"),
+        InlineKeyboardButton("Media", callback_data=f"{CALLBACK_PREFIX}:{token}:image_quality:medium"),
+        InlineKeyboardButton("Baja", callback_data=f"{CALLBACK_PREFIX}:{token}:image_quality:low"),
+    ]])
+
+
+def _content_type_text(metadata: VideoMetadata, source_url: str) -> str:
+    """Show text when asking for content type."""
+    title = metadata.title or "Enlace detectado"
+    image_info = f" ({metadata.image_count} imágenes)" if metadata.image_count > 1 else " (1 imagen)"
+    return (
+        f"{title}\n\n"
+        f"Este enlace contiene video e imagenes{image_info}.\n"
+        f"¿Qué deseas descargar?\n\n{source_url}"
+    )
+
+
+def _album_option_text(metadata: VideoMetadata) -> str:
+    """Show text when asking for album options."""
+    title = metadata.title or "Enlace detectado"
+    if metadata.image_count == 1:
+        return f"{title}\n\nEste enlace contiene 1 imagen.\n\nElige que descargar:"
+    return (
+        f"{title}\n\n"
+        f"Este album tiene {metadata.image_count} imagenes.\n"
+        f"¿Cuántas deseas descargar?"
+    )
+
+
+def _image_quality_text(metadata: VideoMetadata, count: int) -> str:
+    """Show text when asking for image quality."""
+    title = metadata.title or "Enlace detectado"
+    label = f"{count} imagen" if count == 1 else f"{count} imagenes"
+    return f"{title}\n\nDescargarás {label}.\n\nElige calidad:"
+
+
+def _selected_image_count(metadata: VideoMetadata, count: int) -> int:
+    if count == -1:
+        return metadata.image_count
+    return min(count, metadata.image_count or count)

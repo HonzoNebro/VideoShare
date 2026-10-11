@@ -65,13 +65,13 @@ CAPTION_MODE_GROUP=none
 
 Valores admitidos: `full`, `link`, `none`.
 
-Al recibir un enlace, el bot muestra botones para elegir `Video` o `Audio` y despues `Alta`, `Media` o `Baja`.
-Los archivos enviados se recuerdan durante 30 dias usando el `file_id` de Telegram en `DOWNLOAD_DIR/cache.sqlite3`. Esto permite mandar una copia de la misma variante sin mostrar el autor del mensaje original y sin volver a procesarla.
-Cada enlace puede crear hasta seis entradas de cache, una por variante, pero solo cuando alguien la pide.
+Al recibir un enlace, el bot muestra botones para elegir `Video` o `Audio` y despues `Alta`, `Media` o `Baja`. Si el enlace contiene imagenes, permite elegir `Primera` o `Todas` y la calidad de imagen; si mezcla video e imagenes, primero pregunta que tipo descargar.
+Los archivos enviados se recuerdan durante 30 dias usando el `file_id` de Telegram en `DOWNLOAD_DIR/cache.sqlite3`. Esto permite mandar una copia de la misma variante sin mostrar el autor del mensaje original y sin volver a procesarla. Los albumes guardan la lista ordenada de fotos enviadas.
+Cada enlace puede crear varias entradas de cache, una por variante, pero solo cuando alguien la pide.
 Los videos rechazados por duracion o tamano estimado tambien se recuerdan durante ese TTL para responder rapido si se repiten.
 Los errores operativos de Telegram, codigo o configuracion se envian por privado a `ERROR_REPORT_USER_ID` si esta configurado.
 
-Por defecto solo se procesa un video pesado a la vez con `MAX_CONCURRENT_JOBS=1`. Si llega otro enlace no cacheado, el bot muestra que esta en cola.
+Por defecto solo se procesa un contenido pesado a la vez con `MAX_CONCURRENT_JOBS=1`. Si llega otro enlace no cacheado, el bot muestra que esta en cola.
 El progreso se actualiza como maximo cada 10 segundos salvo cambios de fase importantes.
 
 Para Raspberry Pi 4, valores razonables:
@@ -135,6 +135,23 @@ YTDLP_REMOTE_COMPONENTS=ejs:npm
 ```
 
 Reinicia el bot despues. Protege ese archivo con permisos restrictivos.
+
+Para X e Instagram usa cuentas dedicadas y archivos separados, tambien en formato Netscape:
+
+```env
+YTDLP_X_COOKIES_FILE=/opt/videoshare-bot/cookies-x.txt
+YTDLP_INSTAGRAM_COOKIES_FILE=/opt/videoshare-bot/cookies-instagram.txt
+```
+
+Aplica permisos restrictivos y reinicia el bot:
+
+```bash
+chmod 600 /opt/videoshare-bot/cookies-x.txt /opt/videoshare-bot/cookies-instagram.txt
+sudo systemctl restart videoshare-bot
+```
+
+Las sesiones dedicadas se usan solo para sus dominios. Si una caduca, reemplaza ese archivo; el bot no cambia automaticamente a la cookie global ni intenta acceder a contenido privado.
+
 Si ves `n challenge solving failed` o `Only images are available`, instala Deno 2+ en la Raspberry y vuelve a ejecutar `bash scripts/run.sh --install`.
 
 Diagnostico rapido:

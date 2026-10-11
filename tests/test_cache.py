@@ -109,6 +109,23 @@ def test_cache_stores_variants_as_independent_entries(tmp_path) -> None:
     assert cache.get_alias("https://www.youtube.com/watch?v=abc") == "youtube:abc"
 
 
+def test_cache_stores_photo_album_file_ids_in_order(tmp_path) -> None:
+    cache = VideoCache(tmp_path / "cache.sqlite3", ttl_days=30)
+
+    cache.put_album(
+        cache_key="instagram:abc:image-medium-countall",
+        file_ids=["photo-1", "photo-2"],
+        title="Album",
+    )
+
+    entry = cache.get("instagram:abc:image-medium-countall")
+
+    assert entry is not None
+    assert entry.media_type == "photo_album"
+    assert entry.title == "Album"
+    assert cache.album_file_ids(entry) == ["photo-1", "photo-2"]
+
+
 def test_cache_prunes_expired_aliases(tmp_path) -> None:
     db_path = tmp_path / "cache.sqlite3"
     cache = VideoCache(db_path, ttl_days=30)
