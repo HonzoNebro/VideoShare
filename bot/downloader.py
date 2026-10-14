@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import asyncio
 import hashlib
 from http.cookiejar import MozillaCookieJar
+import json
 import logging
 import os
 from pathlib import Path
@@ -37,6 +38,13 @@ class DownloadError(RuntimeError):
 
 class OversizeError(DownloadError):
     """Raised when no sendable file can be produced."""
+
+
+@dataclass(frozen=True)
+class MediaStreams:
+    video_codec: str | None
+    audio_codec: str | None
+    duration_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -314,6 +322,49 @@ def calculate_video_bitrate_kbps(
     return video_kbps
 
 
+def _probe_media_streams(file_path: Path) -> MediaStreams:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name:format=duration",
+        "-of",
+        "json",
+        str(file_path),
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        info = json.loads(completed.stdout)
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise DownloadError("No he podido comprobar los streams del video descargado.") from exc
+
+    streams = info.get("streams") if isinstance(info, dict) else None
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    if isinstance(streams, list):
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            codec_type = stream.get("codec_type")
+            codec_name = stream.get("codec_name")
+            if not isinstance(codec_name, str):
+                continue
+            if codec_type == "video" and video_codec is None:
+                video_codec = codec_name.lower()
+            elif codec_type == "audio" and audio_codec is None:
+                audio_codec = codec_name.lower()
+
+    duration_seconds: float | None = None
+    media_format = info.get("format") if isinstance(info, dict) else None
+    if isinstance(media_format, dict):
+        try:
+            duration_seconds = float(media_format["duration"])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return MediaStreams(video_codec, audio_codec, duration_seconds)
+
+
 def _format_centiseconds(total_centiseconds: int) -> str:
     minutes, remainder = divmod(total_centiseconds, 60 * 100)
     seconds, centiseconds = divmod(remainder, 100)
@@ -507,6 +558,12 @@ class VideoDownloader:
             info = cast(dict[str, Any], ydl.extract_info(url, download=True))
             filename = _prepare_filename(ydl, info)
 
+        for candidate in (info.get("filepath"), info.get("_filename"), filename):
+            if isinstance(candidate, str):
+                prepared = Path(candidate)
+                if prepared.exists():
+                    return prepared
+
         candidates = sorted(task_dir.glob("*"), key=lambda path: path.stat().st_mtime, reverse=True)
         if variant.kind == "audio":
             audio_candidates = [
@@ -518,10 +575,6 @@ class VideoDownloader:
         mp4_candidates = [path for path in candidates if path.suffix.lower() == ".mp4"]
         if mp4_candidates:
             return mp4_candidates[0]
-
-        prepared = Path(filename)
-        if prepared.exists():
-            return prepared
 
         if candidates:
             return candidates[0]
@@ -615,16 +668,33 @@ class VideoDownloader:
             _report(progress, "Preparando envio", 80)
             return file_path
 
-        if variant.kind == "video" and suffix == ".mp4" and file_path.stat().st_size <= self.max_upload_bytes:
-            _report(progress, "Preparando envio", 80)
-            return file_path
+        video_streams: MediaStreams | None = None
+        if variant.kind == "video":
+            video_streams = _probe_media_streams(file_path)
+            if not video_streams.audio_codec:
+                raise DownloadError(
+                    "El video descargado no contiene una pista de audio. "
+                    "Prueba otra calidad o vuelve a enviar el enlace."
+                )
+            if (
+                suffix == ".mp4"
+                and file_path.stat().st_size <= self.max_upload_bytes
+                and video_streams.video_codec == "h264"
+                and video_streams.audio_codec == "aac"
+            ):
+                _report(progress, "Preparando envio", 80)
+                return file_path
 
         normalized = file_path.with_suffix(".telegram.m4a" if variant.kind == "audio" else ".telegram.mp4")
         _report(progress, "Reduciendo calidad", 70)
         if variant.kind == "audio":
             self._transcode_audio(file_path, normalized, variant)
         else:
-            self._transcode_video(file_path, normalized, metadata.duration)
+            self._transcode_video(
+                file_path,
+                normalized,
+                video_streams.duration_seconds if video_streams else metadata.duration,
+            )
         if normalized.stat().st_size <= self.max_upload_bytes:
             _report(progress, "Preparando envio", 80)
             return normalized

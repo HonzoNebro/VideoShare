@@ -2,6 +2,7 @@ from bot.downloader import (
     DownloadError,
     DownloadVariant,
     ImageVariant,
+    MediaStreams,
     TrimRange,
     VideoDownloader,
     VideoMetadata,
@@ -234,6 +235,77 @@ def test_audio_variant_format_and_quality() -> None:
     assert _audio_quality_kbps(DownloadVariant("audio", "high")) == "192"
     assert _audio_quality_kbps(DownloadVariant("audio", "medium")) == "128"
     assert _audio_quality_kbps(DownloadVariant("audio", "low")) == "64"
+
+
+def test_ensure_sendable_rejects_video_without_audio(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    metadata = VideoMetadata(
+        video_id="id", title=None, description=None, source_url="https://example.com/video",
+        webpage_url="https://example.com/video", uploader=None, extractor="Example",
+        duration=10, estimated_size_bytes=None,
+    )
+    monkeypatch.setattr(
+        "bot.downloader._probe_media_streams",
+        lambda path: MediaStreams(video_codec="h264", audio_codec=None, duration_seconds=10),
+    )
+
+    try:
+        downloader._ensure_sendable(source, metadata, DownloadVariant("video", "medium"), None)
+    except DownloadError as exc:
+        assert "no contiene una pista de audio" in str(exc)
+    else:
+        raise AssertionError("A video without audio must not be sent")
+
+
+def test_ensure_sendable_keeps_compatible_mp4_without_transcoding(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    metadata = VideoMetadata(
+        video_id="id", title=None, description=None, source_url="https://example.com/video",
+        webpage_url="https://example.com/video", uploader=None, extractor="Example",
+        duration=10, estimated_size_bytes=None,
+    )
+    monkeypatch.setattr(
+        "bot.downloader._probe_media_streams",
+        lambda path: MediaStreams(video_codec="h264", audio_codec="aac", duration_seconds=10),
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_transcode_video",
+        lambda *args: (_ for _ in ()).throw(AssertionError("should not transcode")),
+    )
+
+    assert downloader._ensure_sendable(source, metadata, DownloadVariant("video", "medium"), None) == source
+
+
+def test_ensure_sendable_transcodes_incompatible_video_with_actual_duration(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    source = tmp_path / "video.webm"
+    source.write_bytes(b"video")
+    metadata = VideoMetadata(
+        video_id="id", title=None, description=None, source_url="https://example.com/video",
+        webpage_url="https://example.com/video", uploader=None, extractor="Example",
+        duration=60, estimated_size_bytes=None,
+    )
+    calls: list[float | None] = []
+    monkeypatch.setattr(
+        "bot.downloader._probe_media_streams",
+        lambda path: MediaStreams(video_codec="vp9", audio_codec="opus", duration_seconds=5),
+    )
+
+    def fake_transcode(input_path, output_path, duration):
+        calls.append(duration)
+        output_path.write_bytes(b"telegram")
+
+    monkeypatch.setattr(downloader, "_transcode_video", fake_transcode)
+
+    result = downloader._ensure_sendable(source, metadata, DownloadVariant("video", "medium"), None)
+
+    assert result == tmp_path / "video.telegram.mp4"
+    assert calls == [5]
 
 
 def test_dedicated_cookie_files_are_selected_by_platform_url(tmp_path) -> None:
