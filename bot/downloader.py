@@ -436,16 +436,18 @@ class VideoDownloader:
         progress: ProgressCallback | None = None,
     ) -> VideoResult:
         selected_variant = variant or DownloadVariant("video", "medium")
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                self._fetch_with_metadata_sync,
-                metadata,
-                selected_variant,
-                trim_range,
-                progress,
-            ),
-            timeout=self.timeout_seconds,
-        )
+        work = asyncio.create_task(asyncio.to_thread(
+            self._fetch_with_metadata_sync,
+            metadata,
+            selected_variant,
+            trim_range,
+            progress,
+        ))
+        try:
+            return await asyncio.wait_for(asyncio.shield(work), timeout=self.timeout_seconds)
+        except (TimeoutError, asyncio.CancelledError):
+            work.add_done_callback(self._cleanup_timed_out_video_task)
+            raise
 
     def _extract_metadata_sync(
         self,
@@ -489,9 +491,11 @@ class VideoDownloader:
             shutil.rmtree(task_dir, ignore_errors=True)
             raise DownloadError(_classify_yt_dlp_error(str(exc), metadata.source_url)) from exc
         except subprocess.CalledProcessError as exc:
+            shutil.rmtree(task_dir, ignore_errors=True)
             LOGGER.warning("ffmpeg failed: %s", exc)
             raise DownloadError("No he podido convertir el video a un formato compatible.") from exc
         except TimeoutError as exc:
+            shutil.rmtree(task_dir, ignore_errors=True)
             raise DownloadError("La descarga ha tardado demasiado y se ha cancelado.") from exc
         except Exception:
             shutil.rmtree(task_dir, ignore_errors=True)
@@ -501,6 +505,13 @@ class VideoDownloader:
         task_dir = result.file_path.parent
         if task_dir.is_relative_to(self.download_dir):
             shutil.rmtree(task_dir, ignore_errors=True)
+
+    def _cleanup_timed_out_video_task(self, task: asyncio.Task[VideoResult]) -> None:
+        try:
+            result = task.result()
+        except Exception:
+            return
+        self.cleanup_result(result)
 
     def cleanup_image_result(self, result: ImageResult) -> None:
         parents = {path.parent for path in result.file_paths}
@@ -812,15 +823,17 @@ class VideoDownloader:
             raise DownloadError("El enlace no contiene imágenes")
 
         selected_variant = variant or ImageVariant(quality="medium", count=1)
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                self._fetch_images_with_metadata_sync,
-                metadata,
-                selected_variant,
-                progress,
-            ),
-            timeout=self.timeout_seconds,
-        )
+        work = asyncio.create_task(asyncio.to_thread(
+            self._fetch_images_with_metadata_sync,
+            metadata,
+            selected_variant,
+            progress,
+        ))
+        try:
+            return await asyncio.wait_for(asyncio.shield(work), timeout=self.timeout_seconds)
+        except (TimeoutError, asyncio.CancelledError):
+            work.add_done_callback(self._cleanup_timed_out_image_task)
+            raise
 
     def _fetch_images_with_metadata_sync(
         self,
@@ -858,6 +871,13 @@ class VideoDownloader:
             if isinstance(exc, DownloadError):
                 raise
             raise DownloadError(f"Error al descargar imágenes: {str(exc)}") from exc
+
+    def _cleanup_timed_out_image_task(self, task: asyncio.Task[ImageResult]) -> None:
+        try:
+            result = task.result()
+        except Exception:
+            return
+        self.cleanup_image_result(result)
 
     def _ensure_sendable_images(
         self,

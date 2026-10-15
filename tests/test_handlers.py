@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +23,7 @@ from bot.handlers import (
     _process_variant_selection,
     _send_image_result,
     _is_message_not_modified,
+    _is_disk_full_error,
     _quality_keyboard,
     _validate_selection_limits,
     _validate_metadata_limits,
@@ -182,6 +184,11 @@ def test_message_not_modified_is_benign_telegram_error() -> None:
     )
 
     assert _is_message_not_modified(exc)
+
+
+def test_disk_full_sqlite_error_is_recognized() -> None:
+    assert _is_disk_full_error(sqlite3.OperationalError("database or disk is full"))
+    assert not _is_disk_full_error(sqlite3.OperationalError("database is locked"))
 
 
 def test_error_report_text_contains_operational_context() -> None:

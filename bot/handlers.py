@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 import secrets
 import shutil
+import sqlite3
 import time
 import traceback
 
@@ -232,6 +233,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text(f"{exc}\n\n{url}")
         except DownloadError as exc:
             await message.reply_text(str(exc))
+        except sqlite3.OperationalError as exc:
+            if _is_disk_full_error(exc):
+                LOGGER.error("Storage is full while processing %s", url)
+                await message.reply_text(
+                    "El almacenamiento de la Raspberry esta lleno. "
+                    "El administrador debe liberar espacio antes de reintentarlo."
+                )
+                continue
+            LOGGER.exception("SQLite failed while processing %s", url)
+            await _notify_admin_error(context, services, update, url, exc, "Error de SQLite")
         except TelegramError as exc:
             if _is_message_not_modified(exc):
                 LOGGER.debug("Ignoring Telegram no-op message edit", exc_info=True)
@@ -915,6 +926,10 @@ def cleanup_download_dir(download_dir: Path) -> None:
     for child in download_dir.iterdir():
         if child.is_dir() and (child.name.startswith("video-") or child.name.startswith("images-")):
             shutil.rmtree(child, ignore_errors=True)
+
+
+def _is_disk_full_error(exc: sqlite3.OperationalError) -> bool:
+    return "database or disk is full" in str(exc).lower()
 
 
 def _services(context: ContextTypes.DEFAULT_TYPE) -> BotServices:

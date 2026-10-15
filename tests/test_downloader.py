@@ -6,6 +6,7 @@ from bot.downloader import (
     TrimRange,
     VideoDownloader,
     VideoMetadata,
+    VideoResult,
     _apply_image_quality,
     _audio_quality_kbps,
     _classify_yt_dlp_error,
@@ -306,6 +307,26 @@ def test_ensure_sendable_transcodes_incompatible_video_with_actual_duration(tmp_
 
     assert result == tmp_path / "video.telegram.mp4"
     assert calls == [5]
+
+
+def test_timed_out_video_work_cleanup_removes_completed_result(tmp_path) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    metadata = VideoMetadata(
+        video_id="id", title=None, description=None, source_url="https://example.com/video",
+        webpage_url="https://example.com/video", uploader=None, extractor="Example",
+        duration=10, estimated_size_bytes=None,
+    )
+    task_dir = tmp_path / "video-late"
+    task_dir.mkdir()
+    output = task_dir / "video.mp4"
+    output.write_bytes(b"video")
+
+    class CompletedTask:
+        def result(self) -> VideoResult:
+            return VideoResult(output, metadata, DownloadVariant("video", "medium"))
+
+    downloader._cleanup_timed_out_video_task(CompletedTask())  # type: ignore[arg-type]
+    assert not task_dir.exists()
 
 
 def test_dedicated_cookie_files_are_selected_by_platform_url(tmp_path) -> None:
