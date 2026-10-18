@@ -268,7 +268,7 @@ def test_cache_sent_message_stores_variant_cache_key(tmp_path) -> None:
 
     _cache_sent_message(services, _metadata(), DownloadVariant("audio", "low"), sent)
 
-    entry = services.cache.get("example:id:audio-low")
+    entry = services.cache.get("example:id:audio-low:audio-validated-v1")
 
     assert entry is not None
     assert entry.media_type == "audio"

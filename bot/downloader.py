@@ -40,6 +40,10 @@ class OversizeError(DownloadError):
     """Raised when no sendable file can be produced."""
 
 
+class AudioUnavailableError(DownloadError):
+    """Raised when the downloaded audio is missing or effectively silent."""
+
+
 @dataclass(frozen=True)
 class MediaStreams:
     video_codec: str | None
@@ -278,6 +282,8 @@ def variant_cache_key(
     key = f"{metadata.cache_key}:{variant.cache_suffix}"
     if trim_range:
         key = f"{key}:{trim_range.cache_suffix}"
+    if isinstance(variant, DownloadVariant):
+        key = f"{key}:audio-validated-v1"
     return key
 
 
@@ -363,6 +369,23 @@ def _probe_media_streams(file_path: Path) -> MediaStreams:
         except (KeyError, TypeError, ValueError):
             pass
     return MediaStreams(video_codec, audio_codec, duration_seconds)
+
+
+def _audio_is_silent(file_path: Path) -> bool:
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-i", str(file_path),
+        "-map", "0:a:0", "-vn", "-af", "volumedetect", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        LOGGER.warning("Could not analyze downloaded audio: %s", type(exc).__name__)
+        raise DownloadError("No he podido comprobar el audio del archivo descargado.") from exc
+    match = re.search(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB", result.stderr)
+    if not match:
+        LOGGER.warning("Could not determine downloaded audio volume")
+        raise DownloadError("No he podido comprobar el audio del archivo descargado.")
+    return match.group(1) == "-inf" or float(match.group(1)) <= -60
 
 
 def _format_centiseconds(total_centiseconds: int) -> str:
@@ -473,14 +496,33 @@ class VideoDownloader:
         try:
             _report(progress, _download_label(variant), 25)
             downloaded = self._download(metadata.source_url, task_dir, variant, progress, trim_range)
-            prepared = self._trim_download(
-                downloaded,
-                trim_range,
-                variant,
-                progress,
-                section_downloaded=bool(trim_range and download_range_func),
-            )
-            sendable = self._ensure_sendable(prepared, metadata, variant, progress)
+            for attempt in range(2):
+                prepared = self._trim_download(
+                    downloaded,
+                    trim_range,
+                    variant,
+                    progress,
+                    section_downloaded=bool(trim_range and download_range_func),
+                )
+                try:
+                    sendable = self._ensure_sendable(prepared, metadata, variant, progress)
+                    break
+                except AudioUnavailableError:
+                    if attempt:
+                        raise
+                    _report(progress, "Buscando otra pista de audio", 30)
+                    alternate_dir = task_dir / "alternate"
+                    alternate_dir.mkdir()
+                    try:
+                        downloaded = self._download(
+                            metadata.source_url, alternate_dir, variant, progress, trim_range,
+                            format_selector=_alternate_audio_selector(variant),
+                        )
+                    except YtDlpDownloadError as exc:
+                        raise AudioUnavailableError(
+                            "No he encontrado una variante con audio audible. "
+                            "Puede que el contenido original no tenga sonido."
+                        ) from exc
             return VideoResult(
                 file_path=sendable,
                 metadata=metadata,
@@ -502,9 +544,12 @@ class VideoDownloader:
             raise
 
     def cleanup_result(self, result: VideoResult) -> None:
-        task_dir = result.file_path.parent
-        if task_dir.is_relative_to(self.download_dir):
-            shutil.rmtree(task_dir, ignore_errors=True)
+        try:
+            relative = result.file_path.relative_to(self.download_dir)
+        except ValueError:
+            return
+        if len(relative.parts) >= 2 and relative.parts[0].startswith("video-"):
+            shutil.rmtree(self.download_dir / relative.parts[0], ignore_errors=True)
 
     def _cleanup_timed_out_video_task(self, task: asyncio.Task[VideoResult]) -> None:
         try:
@@ -538,11 +583,13 @@ class VideoDownloader:
         variant: DownloadVariant,
         progress: ProgressCallback | None,
         trim_range: TrimRange | None = None,
+        *,
+        format_selector: str | None = None,
     ) -> Path:
         output_template = str(task_dir / "%(title).180B-%(id)s.%(ext)s")
         opts: dict[str, Any] = self._base_ydl_opts(url)
         opts.update({
-            "format": _format_selector(variant, self.max_video_height),
+            "format": format_selector or _format_selector(variant, self.max_video_height),
             "merge_output_format": "m4a" if variant.kind == "audio" else "mp4",
             "outtmpl": output_template,
             "noplaylist": True,
@@ -553,6 +600,8 @@ class VideoDownloader:
             "overwrites": True,
             "progress_hooks": [_download_progress_hook(progress)] if progress else [],
         })
+        if variant.kind == "video":
+            opts["format_sort"] = ["res", "vcodec:h264", "acodec:aac"]
         if trim_range and download_range_func:
             opts["download_ranges"] = download_range_func(
                 None,
@@ -675,18 +724,22 @@ class VideoDownloader:
         progress: ProgressCallback | None,
     ) -> Path:
         suffix = file_path.suffix.lower()
+        streams = _probe_media_streams(file_path)
+        if not streams.audio_codec:
+            raise AudioUnavailableError("El archivo descargado no contiene una pista de audio.")
+        _report(progress, "Comprobando audio", 69)
+        if _audio_is_silent(file_path):
+            raise AudioUnavailableError(
+                "El audio descargado parece estar en silencio, incluso al probar otra variante. "
+                "Puede que el contenido original no tenga sonido."
+            )
         if variant.kind == "audio" and suffix in {".m4a", ".mp3"} and file_path.stat().st_size <= self.max_upload_bytes:
             _report(progress, "Preparando envio", 80)
             return file_path
 
         video_streams: MediaStreams | None = None
         if variant.kind == "video":
-            video_streams = _probe_media_streams(file_path)
-            if not video_streams.audio_codec:
-                raise DownloadError(
-                    "El video descargado no contiene una pista de audio. "
-                    "Prueba otra calidad o vuelve a enviar el enlace."
-                )
+            video_streams = streams
             if (
                 suffix == ".mp4"
                 and file_path.stat().st_size <= self.max_upload_bytes
@@ -695,6 +748,18 @@ class VideoDownloader:
             ):
                 _report(progress, "Preparando envio", 80)
                 return file_path
+
+            if video_streams.video_codec == "h264" and file_path.stat().st_size <= self.max_upload_bytes:
+                normalized = file_path.with_suffix(".telegram.mp4")
+                _report(progress, "Preparando audio", 70)
+                try:
+                    self._remux_video(file_path, normalized, copy_audio=video_streams.audio_codec == "aac")
+                except subprocess.CalledProcessError:
+                    LOGGER.warning("Could not remux video; falling back to conversion")
+                else:
+                    if normalized.stat().st_size <= self.max_upload_bytes:
+                        _report(progress, "Preparando envio", 80)
+                        return normalized
 
         normalized = file_path.with_suffix(".telegram.m4a" if variant.kind == "audio" else ".telegram.mp4")
         _report(progress, "Reduciendo calidad", 70)
@@ -711,6 +776,16 @@ class VideoDownloader:
             return normalized
 
         raise OversizeError(_oversize_after_transcode_message(variant))
+
+    def _remux_video(self, input_path: Path, output_path: Path, *, copy_audio: bool) -> None:
+        command = [
+            "ffmpeg", "-y", "-i", str(input_path), "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-c:a", "copy" if copy_audio else "aac",
+        ]
+        if not copy_audio:
+            command += ["-b:a", "96k"]
+        command += ["-movflags", "+faststart", str(output_path)]
+        subprocess.run(command, check=True, capture_output=True)
 
     def _transcode_video(self, input_path: Path, output_path: Path, duration: float | None) -> None:
         bitrate_kbps = calculate_video_bitrate_kbps(
@@ -991,6 +1066,13 @@ def _format_selector(variant: DownloadVariant, fallback_max_video_height: int) -
         f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
         f"best[height<={max_height}]/best[height<=360]/worst"
     )
+
+
+def _alternate_audio_selector(variant: DownloadVariant) -> str:
+    if variant.kind == "audio":
+        return "bestaudio/best[acodec!=none]"
+    height = "" if variant.quality == "high" else f"[height<={720 if variant.quality == 'medium' else 360}]"
+    return f"bestvideo{height}+bestaudio/best{height}[acodec!=none]"
 
 
 def _audio_quality_kbps(variant: DownloadVariant) -> str:

@@ -1,4 +1,10 @@
+import shutil
+import subprocess
+
+import pytest
+
 from bot.downloader import (
+    AudioUnavailableError,
     DownloadError,
     DownloadVariant,
     ImageVariant,
@@ -9,6 +15,7 @@ from bot.downloader import (
     VideoResult,
     _apply_image_quality,
     _audio_quality_kbps,
+    _audio_is_silent,
     _classify_yt_dlp_error,
     _detect_content_type,
     _format_selector,
@@ -99,15 +106,15 @@ def test_variant_cache_key_includes_kind_and_quality() -> None:
         estimated_size_bytes=None,
     )
 
-    assert variant_cache_key(metadata, DownloadVariant("video", "high")) == "youtube:abc123:video-high"
-    assert variant_cache_key(metadata, DownloadVariant("audio", "low")) == "youtube:abc123:audio-low"
+    assert variant_cache_key(metadata, DownloadVariant("video", "high")) == "youtube:abc123:video-high:audio-validated-v1"
+    assert variant_cache_key(metadata, DownloadVariant("audio", "low")) == "youtube:abc123:audio-low:audio-validated-v1"
     assert (
         variant_cache_key(
             metadata,
             DownloadVariant("video", "high"),
             TrimRange(start_seconds=83.16, end_seconds=130),
         )
-        == "youtube:abc123:video-high:clip-8316-13000"
+        == "youtube:abc123:video-high:clip-8316-13000:audio-validated-v1"
     )
 
 
@@ -273,6 +280,7 @@ def test_ensure_sendable_keeps_compatible_mp4_without_transcoding(tmp_path, monk
         "bot.downloader._probe_media_streams",
         lambda path: MediaStreams(video_codec="h264", audio_codec="aac", duration_seconds=10),
     )
+    monkeypatch.setattr("bot.downloader._audio_is_silent", lambda path: False)
     monkeypatch.setattr(
         downloader,
         "_transcode_video",
@@ -296,6 +304,7 @@ def test_ensure_sendable_transcodes_incompatible_video_with_actual_duration(tmp_
         "bot.downloader._probe_media_streams",
         lambda path: MediaStreams(video_codec="vp9", audio_codec="opus", duration_seconds=5),
     )
+    monkeypatch.setattr("bot.downloader._audio_is_silent", lambda path: False)
 
     def fake_transcode(input_path, output_path, duration):
         calls.append(duration)
@@ -307,6 +316,105 @@ def test_ensure_sendable_transcodes_incompatible_video_with_actual_duration(tmp_
 
     assert result == tmp_path / "video.telegram.mp4"
     assert calls == [5]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_audio_silence_detection_distinguishes_silence_and_tone(tmp_path) -> None:
+    silent = tmp_path / "silent.wav"
+    tone = tmp_path / "tone.wav"
+    partial = tmp_path / "partial.wav"
+    for path, source in ((silent, "anullsrc=r=8000:cl=mono"), (tone, "sine=frequency=440:sample_rate=8000")):
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", source, "-t", "1", str(path)],
+            check=True,
+            capture_output=True,
+        )
+
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000",
+         "-af", "volume=0:enable='lt(t,1)'", "-t", "2", str(partial)],
+        check=True, capture_output=True,
+    )
+
+    assert _audio_is_silent(silent)
+    assert not _audio_is_silent(tone)
+    assert not _audio_is_silent(partial)
+
+
+def test_h264_with_other_audio_is_remuxed_without_recoding_video(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    source = tmp_path / "video.mp4"
+    source.write_bytes(b"video")
+    metadata = VideoMetadata(
+        video_id="id", title=None, description=None, source_url="https://example.com/video",
+        webpage_url="https://example.com/video", uploader=None, extractor="Example",
+        duration=10, estimated_size_bytes=None,
+    )
+    monkeypatch.setattr("bot.downloader._probe_media_streams", lambda path: MediaStreams("h264", "opus", 10))
+    monkeypatch.setattr("bot.downloader._audio_is_silent", lambda path: False)
+    calls = []
+
+    def remux(input_path, output_path, *, copy_audio):
+        calls.append(copy_audio)
+        output_path.write_bytes(b"result")
+
+    monkeypatch.setattr(downloader, "_remux_video", remux)
+    result = downloader._ensure_sendable(source, metadata, DownloadVariant("video", "medium"), None)
+
+    assert result == tmp_path / "video.telegram.mp4"
+    assert calls == [False]
+
+
+def test_remux_copies_video_and_converts_only_audio(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    commands = []
+    monkeypatch.setattr("bot.downloader.subprocess.run", lambda command, **kwargs: commands.append(command))
+
+    downloader._remux_video(tmp_path / "input.mp4", tmp_path / "output.mp4", copy_audio=False)
+
+    command = commands[0]
+    assert command[command.index("-c:v") + 1] == "copy"
+    assert command[command.index("-c:a") + 1] == "aac"
+
+
+def test_failed_audio_analysis_reports_error_instead_of_assuming_sound(tmp_path, monkeypatch) -> None:
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "ffmpeg")
+
+    monkeypatch.setattr("bot.downloader.subprocess.run", fail)
+    with pytest.raises(DownloadError, match="comprobar el audio"):
+        _audio_is_silent(tmp_path / "video.mp4")
+
+
+def test_missing_audio_retries_alternate_and_cleans_both_directories(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    metadata = VideoMetadata(
+        video_id="id", title=None, description=None, source_url="https://example.com/video",
+        webpage_url="https://example.com/video", uploader=None, extractor="Example",
+        duration=10, estimated_size_bytes=None,
+    )
+    selectors = []
+
+    def fake_download(url, task_dir, variant, progress, trim_range, **kwargs):
+        selectors.append(kwargs.get("format_selector"))
+        output = task_dir / "video.mp4"
+        output.write_bytes(b"video")
+        return output
+
+    def fake_ensure(path, metadata, variant, progress):
+        if len(selectors) == 1:
+            raise AudioUnavailableError("missing")
+        return path
+
+    monkeypatch.setattr(downloader, "_download", fake_download)
+    monkeypatch.setattr(downloader, "_ensure_sendable", fake_ensure)
+    result = downloader._fetch_with_metadata_sync(metadata, DownloadVariant("video", "medium"))
+    task_dir = result.file_path.parent.parent
+
+    assert selectors[0] is None
+    assert "bestaudio" in selectors[1]
+    downloader.cleanup_result(result)
+    assert not task_dir.exists()
 
 
 def test_timed_out_video_work_cleanup_removes_completed_result(tmp_path) -> None:

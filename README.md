@@ -139,11 +139,14 @@ Comandos utiles:
 - Permite descargar imagenes individuales y albumes/carruseles como fotos nativas de Telegram.
 - Permite recortar video o audio indicando un rango `MM:SS.cc-MM:SS.cc`.
 - Intenta producir MP4 para video y M4A/MP3 para audio.
+- Comprueba que exista una pista de audio y analiza su volumen sin recodificar el video. Si falta o toda la pista es practicamente silenciosa, intenta otra seleccion de formatos y avisa si no encuentra audio audible. Puede tratarse de un silencio intencionado; ruido audible no se distingue de voz o musica.
+- Cuando el video H.264 es compatible, copia su pista y convierte solo el audio a AAC si hace falta; para otros codecs de video puede ser necesaria una conversion completa.
 - Convierte y recomprime imagenes con Pillow cuando hace falta para que Telegram las acepte como foto.
 - Si el archivo supera `MAX_UPLOAD_MB`, intenta reducir calidad con `ffmpeg`.
 - Si no puede reducirlo lo suficiente, devuelve un aviso y el enlace original.
 - Cachea durante 30 dias el `file_id` devuelto por Telegram para reenviar copias de la misma variante sin descargarla ni recomprimirla de nuevo. Los albumes guardan la lista ordenada de `file_id`.
 - Un mismo enlace puede tener entradas separadas para `video-high`, `video-medium`, `video-low`, `audio-high`, `audio-medium`, `audio-low`, `image-*-count1` e `image-*-countall`; solo se crean cuando alguien pide esa variante.
+- Las variantes de audio y video validadas utilizan claves de cache versionadas, por lo que no reutilizan archivos anteriores que no hayan pasado la comprobacion de audio.
 - Mantiene alias de URL normalizadas para vincular enlaces repetidos con la clave base del video.
 - Recuerda durante el mismo TTL los videos rechazados por duracion o tamano estimado para no volver a procesarlos.
 - No guarda videos procesados de forma permanente; la cache por defecto es SQLite en `DOWNLOAD_DIR/cache.sqlite3`.
