@@ -84,6 +84,7 @@ def build_application() -> Application:
     builder = builder.connect_timeout(settings.telegram_connect_timeout_seconds)
     builder = builder.read_timeout(settings.telegram_read_timeout_seconds)
     builder = builder.write_timeout(settings.telegram_write_timeout_seconds)
+    builder = builder.media_write_timeout(settings.telegram_write_timeout_seconds)
     builder = builder.pool_timeout(settings.telegram_pool_timeout_seconds)
     if settings.telegram_api_base_url:
         builder = builder.base_url(settings.telegram_api_base_url)
