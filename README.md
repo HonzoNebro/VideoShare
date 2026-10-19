@@ -134,6 +134,7 @@ Comandos utiles:
 ## Comportamiento
 
 - Soporta enlaces publicos de sitios admitidos por `yt-dlp`.
+- Convierte enlaces de `old.reddit.com` a `www.reddit.com` para procesarlos, conservando el enlace original. Esto no evita restricciones de acceso, edad o sesion de Reddit.
 - Puede usar sesiones dedicadas de X e Instagram para contenido publico bloqueado tras inicio de sesion.
 - Permite elegir video o solo audio y tres niveles de calidad por enlace.
 - Permite descargar imagenes individuales y albumes/carruseles como fotos nativas de Telegram.

@@ -21,7 +21,7 @@ TRACKING_PARAMS = {
 
 
 def normalize_url(url: str) -> str:
-    parsed = urlparse(url.strip())
+    parsed = urlparse(reddit_extraction_url(url.strip()))
     scheme = parsed.scheme.lower() or "https"
     netloc = parsed.netloc.lower()
     path = _normalize_path(parsed.path)
@@ -32,6 +32,14 @@ def normalize_url(url: str) -> str:
 
     query = _normalize_query(parsed.query)
     return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def reddit_extraction_url(url: str) -> str:
+    """Use the modern Reddit host without changing the requested post or query."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc.lower() == "old.reddit.com":
+        return urlunparse(parsed._replace(netloc="www.reddit.com"))
+    return url
 
 
 def _normalize_path(path: str) -> str:

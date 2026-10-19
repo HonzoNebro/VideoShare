@@ -530,6 +530,46 @@ def test_metadata_and_video_download_select_cookies_for_the_source_url(tmp_path,
     assert selected_urls == [source_url, source_url]
 
 
+def test_old_reddit_url_is_normalized_for_metadata_and_download(tmp_path, monkeypatch) -> None:
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    source_url = "https://old.reddit.com/r/videos/comments/abc/title/?context=3"
+    expected_url = "https://www.reddit.com/r/videos/comments/abc/title/?context=3"
+    requested = []
+    downloaded = tmp_path / "video.mp4"
+
+    class FakeYdl:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def extract_info(self, url, download):
+            requested.append((url, download))
+            if download:
+                downloaded.write_bytes(b"video")
+            return {"id": "abc", "title": "title", "formats": []}
+
+        def prepare_filename(self, info):
+            return str(downloaded)
+
+    monkeypatch.setattr("bot.downloader._youtube_dl", lambda opts: FakeYdl())
+
+    metadata = downloader._extract_metadata(source_url)
+    downloader._download(metadata.source_url, tmp_path, DownloadVariant("video", "medium"), None)
+
+    assert metadata.source_url == source_url
+    assert requested == [(expected_url, False), (expected_url, True)]
+
+
+def test_reddit_errors_distinguish_login_from_private_content() -> None:
+    url = "https://old.reddit.com/r/videos/comments/abc/title"
+    assert "sesion" in _classify_yt_dlp_error("Account authentication is required", url)
+    assert "comunidad privada" in _classify_yt_dlp_error("Private subreddit; login required", url)
+    assert "API" in _classify_yt_dlp_error("Your IP address is unable to access the Reddit API", url)
+    assert _classify_yt_dlp_error("video was deleted", url) == "No he podido descargar ese enlace."
+
+
 def test_image_download_uses_the_platform_selected_cookie_file(tmp_path, monkeypatch) -> None:
     instagram_cookies = tmp_path / "cookies-instagram.txt"
     instagram_cookies.write_text("# Netscape HTTP Cookie File\n")

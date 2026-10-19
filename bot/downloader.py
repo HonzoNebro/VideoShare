@@ -20,6 +20,8 @@ import yt_dlp
 from yt_dlp.utils import DownloadError as YtDlpDownloadError
 from PIL import Image
 
+from bot.url_normalizer import reddit_extraction_url
+
 try:
     from yt_dlp.utils import download_range_func
 except ImportError:  # pragma: no cover - depends on yt-dlp version
@@ -573,7 +575,7 @@ class VideoDownloader:
             "noplaylist": True,
         })
         with _youtube_dl(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(reddit_extraction_url(url), download=False)
         return _metadata_from_info(cast(dict[str, Any], info), url)
 
     def _download(
@@ -615,7 +617,7 @@ class VideoDownloader:
                 "preferredquality": _audio_quality_kbps(variant),
             }]
         with _youtube_dl(opts) as ydl:
-            info = cast(dict[str, Any], ydl.extract_info(url, download=True))
+            info = cast(dict[str, Any], ydl.extract_info(reddit_extraction_url(url), download=True))
             filename = _prepare_filename(ydl, info)
 
         for candidate in (info.get("filepath"), info.get("_filename"), filename):
@@ -996,6 +998,18 @@ def _classify_yt_dlp_error(message: str, source_url: str | None = None) -> str:
         return "X requiere una sesion valida para este enlace. Renueva YTDLP_X_COOKIES_FILE."
     if platform == "Instagram" and any(marker in lower for marker in authentication_markers):
         return "Instagram requiere una sesion valida para este enlace. Renueva YTDLP_INSTAGRAM_COOKIES_FILE."
+
+    host = (urlparse(source_url).hostname or "").lower().rstrip(".") if source_url else ""
+    if host == "redd.it" or host == "reddit.com" or host.endswith(".reddit.com"):
+        if "private subreddit" in lower:
+            return "No he podido acceder a esa comunidad privada de Reddit."
+        if "unable to access the reddit api" in lower:
+            return "Reddit ha bloqueado el acceso a su API desde esta conexion. Intentalo mas tarde."
+        if any(marker in lower for marker in authentication_markers + ("quarantined", "age-restricted")):
+            return (
+                "Reddit puede requerir una sesion valida o limitar el acceso a esta publicacion. "
+                "Para contenido publico, revisa YTDLP_COOKIES_FILE y actualiza yt-dlp."
+            )
 
     bot_markers = ("not a bot", "confirm you're not a bot", "confirm you’re not a bot")
     if any(marker in lower for marker in bot_markers):
