@@ -90,6 +90,7 @@ class Settings:
     ytdlp_cookies_file: Path | None = None
     ytdlp_x_cookies_file: Path | None = None
     ytdlp_instagram_cookies_file: Path | None = None
+    ytdlp_reddit_cookies_file: Path | None = None
     ytdlp_js_runtimes: str | None = None
     ytdlp_remote_components: str | None = None
 
@@ -155,6 +156,11 @@ def load_settings(env_file: str | os.PathLike[str] | None = ".env") -> Settings:
         ytdlp_instagram_cookies_file=(
             Path(os.getenv("YTDLP_INSTAGRAM_COOKIES_FILE", "")).expanduser()
             if os.getenv("YTDLP_INSTAGRAM_COOKIES_FILE", "").strip()
+            else None
+        ),
+        ytdlp_reddit_cookies_file=(
+            Path(os.getenv("YTDLP_REDDIT_COOKIES_FILE", "")).expanduser()
+            if os.getenv("YTDLP_REDDIT_COOKIES_FILE", "").strip()
             else None
         ),
         ytdlp_js_runtimes=os.getenv("YTDLP_JS_RUNTIMES", "").strip() or None,

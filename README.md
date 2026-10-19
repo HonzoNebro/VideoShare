@@ -194,11 +194,12 @@ Para YouTube moderno, instala tambien un runtime JavaScript compatible. Deno 2+ 
 
 ### Sesiones dedicadas de X e Instagram
 
-Para enlaces publicos que X o Instagram obligan a abrir con sesion, usa cuentas tecnicas dedicadas y exporta las cookies de cada dominio por separado, en formato Netscape:
+Para enlaces publicos que X, Instagram o Reddit obligan a abrir con sesion, usa cuentas tecnicas dedicadas y exporta las cookies de cada dominio por separado, en formato Netscape:
 
 ```env
 YTDLP_X_COOKIES_FILE=/opt/videoshare-bot/cookies-x.txt
 YTDLP_INSTAGRAM_COOKIES_FILE=/opt/videoshare-bot/cookies-instagram.txt
+YTDLP_REDDIT_COOKIES_FILE=/opt/videoshare-bot/cookies-reddit.txt
 ```
 
 Las cookies especificas tienen prioridad sobre `YTDLP_COOKIES_FILE`. Si una de ellas esta configurada pero no puede leerse, el bot avisa para renovarla y no prueba otra cuenta. Esta opcion solo permite acceder al contenido que la cuenta dedicada puede ver legitimamente; no habilita contenido privado ni evita restricciones de la plataforma.
@@ -208,5 +209,7 @@ Protege los archivos y no los añadas a Git:
 ```bash
 chmod 600 /opt/videoshare-bot/cookies-x.txt /opt/videoshare-bot/cookies-instagram.txt
 ```
+
+Para Reddit, protege igualmente el archivo con `chmod 600 /opt/videoshare-bot/cookies-reddit.txt` y reinicia el servicio tras configurar la variable. Una sesion valida no garantiza acceso si Reddit bloquea las solicitudes o cambia su interfaz.
 
 Cuando caduque una sesion, reemplaza solo el archivo de esa plataforma y reinicia el servicio.

@@ -441,7 +441,8 @@ def test_dedicated_cookie_files_are_selected_by_platform_url(tmp_path) -> None:
     generic = tmp_path / "cookies.txt"
     x_cookies = tmp_path / "cookies-x.txt"
     instagram_cookies = tmp_path / "cookies-instagram.txt"
-    for path in (generic, x_cookies, instagram_cookies):
+    reddit_cookies = tmp_path / "cookies-reddit.txt"
+    for path in (generic, x_cookies, instagram_cookies, reddit_cookies):
         path.write_text("# Netscape HTTP Cookie File\n")
     downloader = VideoDownloader(
         download_dir=tmp_path,
@@ -449,11 +450,15 @@ def test_dedicated_cookie_files_are_selected_by_platform_url(tmp_path) -> None:
         cookies_file=generic,
         x_cookies_file=x_cookies,
         instagram_cookies_file=instagram_cookies,
+        reddit_cookies_file=reddit_cookies,
     )
 
     assert downloader._base_ydl_opts("https://mobile.x.com/user/status/1")["cookiefile"] == str(x_cookies)
     assert downloader._base_ydl_opts("https://www.twitter.com/user/status/1")["cookiefile"] == str(x_cookies)
     assert downloader._base_ydl_opts("https://www.instagram.com/reel/abc/")["cookiefile"] == str(instagram_cookies)
+    for url in ("https://old.reddit.com/r/test", "https://reddit.com/r/test", "https://redd.it/abc"):
+        assert downloader._base_ydl_opts(url)["cookiefile"] == str(reddit_cookies)
+    assert downloader._base_ydl_opts("https://notreddit.com/r/test")["cookiefile"] == str(generic)
     assert downloader._base_ydl_opts("https://example.com/video")["cookiefile"] == str(generic)
 
 
@@ -468,6 +473,24 @@ def test_generic_cookie_file_is_used_when_platform_jar_is_not_configured(tmp_pat
 
     assert downloader._base_ydl_opts("https://x.com/user/status/1")["cookiefile"] == str(generic)
     assert downloader._base_ydl_opts("https://instagram.com/p/abc/")["cookiefile"] == str(generic)
+    assert downloader._base_ydl_opts("https://old.reddit.com/r/test")["cookiefile"] == str(generic)
+
+
+def test_invalid_reddit_cookie_does_not_fall_back_or_expose_configuration(tmp_path) -> None:
+    generic = tmp_path / "cookies.txt"
+    generic.write_text("# Netscape HTTP Cookie File\n")
+    downloader = VideoDownloader(
+        download_dir=tmp_path,
+        max_upload_bytes=1024,
+        cookies_file=generic,
+        reddit_cookies_file=tmp_path / "missing-reddit.txt",
+    )
+    try:
+        downloader._base_ydl_opts("https://reddit.com/r/test")
+    except DownloadError as exc:
+        assert str(exc) == "No he podido acceder a esta publicacion de Reddit. Intentalo mas tarde."
+    else:
+        raise AssertionError("An unavailable dedicated cookie file should fail")
 
 
 def test_invalid_dedicated_cookie_file_does_not_fall_back_to_generic(tmp_path) -> None:
@@ -531,10 +554,13 @@ def test_metadata_and_video_download_select_cookies_for_the_source_url(tmp_path,
 
 
 def test_old_reddit_url_is_normalized_for_metadata_and_download(tmp_path, monkeypatch) -> None:
-    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024)
+    cookies = tmp_path / "cookies-reddit.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n")
+    downloader = VideoDownloader(download_dir=tmp_path, max_upload_bytes=1024, reddit_cookies_file=cookies)
     source_url = "https://old.reddit.com/r/videos/comments/abc/title/?context=3"
     expected_url = "https://www.reddit.com/r/videos/comments/abc/title/?context=3"
     requested = []
+    cookie_files = []
     downloaded = tmp_path / "video.mp4"
 
     class FakeYdl:
@@ -553,20 +579,30 @@ def test_old_reddit_url_is_normalized_for_metadata_and_download(tmp_path, monkey
         def prepare_filename(self, info):
             return str(downloaded)
 
-    monkeypatch.setattr("bot.downloader._youtube_dl", lambda opts: FakeYdl())
+    def fake_youtube_dl(opts):
+        cookie_files.append(opts.get("cookiefile"))
+        return FakeYdl()
+
+    monkeypatch.setattr("bot.downloader._youtube_dl", fake_youtube_dl)
 
     metadata = downloader._extract_metadata(source_url)
     downloader._download(metadata.source_url, tmp_path, DownloadVariant("video", "medium"), None)
 
     assert metadata.source_url == source_url
     assert requested == [(expected_url, False), (expected_url, True)]
+    assert cookie_files == [str(cookies), str(cookies)]
 
 
 def test_reddit_errors_distinguish_login_from_private_content() -> None:
     url = "https://old.reddit.com/r/videos/comments/abc/title"
-    assert "sesion" in _classify_yt_dlp_error("Account authentication is required", url)
+    assert _classify_yt_dlp_error("Account authentication is required", url) == (
+        "No he podido acceder a esta publicacion de Reddit. "
+        "Es posible que requiera iniciar sesion o tenga restricciones de acceso."
+    )
     assert "comunidad privada" in _classify_yt_dlp_error("Private subreddit; login required", url)
-    assert "API" in _classify_yt_dlp_error("Your IP address is unable to access the Reddit API", url)
+    assert _classify_yt_dlp_error("Your IP address is unable to access the Reddit API", url) == (
+        "Reddit no ha permitido acceder a esta publicacion. Intentalo de nuevo mas tarde."
+    )
     assert _classify_yt_dlp_error("video was deleted", url) == "No he podido descargar ese enlace."
 
 

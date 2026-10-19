@@ -411,6 +411,7 @@ class VideoDownloader:
         cookies_file: Path | None = None,
         x_cookies_file: Path | None = None,
         instagram_cookies_file: Path | None = None,
+        reddit_cookies_file: Path | None = None,
         js_runtimes: str | None = None,
         remote_components: str | None = None,
         max_video_height: int = 480,
@@ -422,6 +423,7 @@ class VideoDownloader:
         self.cookies_file = cookies_file
         self.x_cookies_file = x_cookies_file
         self.instagram_cookies_file = instagram_cookies_file
+        self.reddit_cookies_file = reddit_cookies_file
         self.js_runtimes = js_runtimes
         self.remote_components = remote_components
         self.max_video_height = max_video_height
@@ -862,10 +864,14 @@ class VideoDownloader:
             url,
             self.x_cookies_file,
             self.instagram_cookies_file,
+            self.reddit_cookies_file,
         )
         if dedicated_file is None:
             return self.cookies_file
         if not dedicated_file.is_file() or not os.access(dedicated_file, os.R_OK):
+            if platform == "Reddit":
+                LOGGER.warning("The configured Reddit session file is unavailable or unreadable.")
+                raise DownloadError("No he podido acceder a esta publicacion de Reddit. Intentalo mas tarde.")
             raise DownloadError(
                 f"La sesion configurada para {platform} no esta disponible. "
                 f"Revisa o renueva {setting_name}."
@@ -1004,11 +1010,13 @@ def _classify_yt_dlp_error(message: str, source_url: str | None = None) -> str:
         if "private subreddit" in lower:
             return "No he podido acceder a esa comunidad privada de Reddit."
         if "unable to access the reddit api" in lower:
-            return "Reddit ha bloqueado el acceso a su API desde esta conexion. Intentalo mas tarde."
+            LOGGER.warning("Reddit API access failed; check connectivity and Reddit access restrictions.")
+            return "Reddit no ha permitido acceder a esta publicacion. Intentalo de nuevo mas tarde."
         if any(marker in lower for marker in authentication_markers + ("quarantined", "age-restricted")):
+            LOGGER.warning("Reddit access requires authentication or is restricted; check the session and yt-dlp version.")
             return (
-                "Reddit puede requerir una sesion valida o limitar el acceso a esta publicacion. "
-                "Para contenido publico, revisa YTDLP_COOKIES_FILE y actualiza yt-dlp."
+                "No he podido acceder a esta publicacion de Reddit. "
+                "Es posible que requiera iniciar sesion o tenga restricciones de acceso."
             )
 
     bot_markers = ("not a bot", "confirm you're not a bot", "confirm you’re not a bot")
@@ -1034,12 +1042,15 @@ def _dedicated_cookie_config(
     url: str | None,
     x_cookies_file: Path | None,
     instagram_cookies_file: Path | None,
+    reddit_cookies_file: Path | None,
 ) -> tuple[Path | None, str | None, str | None]:
     platform = _cookie_platform_for_url(url)
     if platform == "X":
         return x_cookies_file, platform, "YTDLP_X_COOKIES_FILE"
     if platform == "Instagram":
         return instagram_cookies_file, platform, "YTDLP_INSTAGRAM_COOKIES_FILE"
+    if platform == "Reddit":
+        return reddit_cookies_file, platform, "YTDLP_REDDIT_COOKIES_FILE"
     return None, None, None
 
 
@@ -1051,6 +1062,8 @@ def _cookie_platform_for_url(url: str | None) -> str | None:
         return "X"
     if host == "instagram.com" or host.endswith(".instagram.com"):
         return "Instagram"
+    if host in {"reddit.com", "redd.it"} or host.endswith((".reddit.com", ".redd.it")):
+        return "Reddit"
     return None
 
 

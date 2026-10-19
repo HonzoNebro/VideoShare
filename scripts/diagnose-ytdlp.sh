@@ -35,6 +35,7 @@ downloader = VideoDownloader(
     cookies_file=settings.ytdlp_cookies_file,
     x_cookies_file=settings.ytdlp_x_cookies_file,
     instagram_cookies_file=settings.ytdlp_instagram_cookies_file,
+    reddit_cookies_file=settings.ytdlp_reddit_cookies_file,
     js_runtimes=settings.ytdlp_js_runtimes,
     remote_components=settings.ytdlp_remote_components,
     max_video_height=settings.max_video_height,
@@ -49,4 +50,5 @@ print(f"ytdlp_opts: {safe}")
 print(f"cookies_generic: {cookie_status(settings.ytdlp_cookies_file)}")
 print(f"cookies_x: {cookie_status(settings.ytdlp_x_cookies_file)}")
 print(f"cookies_instagram: {cookie_status(settings.ytdlp_instagram_cookies_file)}")
+print(f"cookies_reddit: {cookie_status(settings.ytdlp_reddit_cookies_file)}")
 PY
