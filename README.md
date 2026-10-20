@@ -125,11 +125,12 @@ Las actualizaciones de progreso no criticas se limitan por defecto a una cada 10
 Comandos utiles:
 
 ```text
+/help    muestra todos los comandos disponibles
 /id      muestra user_id y chat_id
 /status  muestra cola, capacidad y estadisticas de cache
 ```
 
-`/id` responde en cualquier chat donde el bot vea el comando para facilitar la configuracion de allowlists. No permite procesar videos por si solo.
+`/help` y `/id` responden en cualquier chat donde el bot vea el comando para facilitar la configuracion de allowlists. `/id` no permite procesar videos por si solo.
 
 ## Comportamiento
 

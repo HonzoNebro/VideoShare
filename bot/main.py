@@ -14,6 +14,7 @@ from bot.handlers import (
     cleanup_download_dir,
     handle_message,
     handle_variant_callback,
+    help_command,
     id_command,
     start,
     status_command,
@@ -100,6 +101,7 @@ def build_application() -> Application:
         cache=cache,
     )
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CallbackQueryHandler(handle_variant_callback, pattern=r"^vs:"))

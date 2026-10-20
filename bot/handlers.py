@@ -46,6 +46,18 @@ from bot.url_normalizer import normalize_url
 LOGGER = logging.getLogger(__name__)
 CALLBACK_PREFIX = "vs"
 
+HELP_TEXT = "\n".join(
+    (
+        "Enviame un enlace publico de video o imagenes y te lo devolvere listo para compartir.",
+        "",
+        "Comandos disponibles:",
+        "/help - muestra esta ayuda",
+        "/id - muestra tu user_id y el chat_id actual",
+        "/status - muestra la cola y el estado de la cache",
+        "/start - muestra esta ayuda",
+    )
+)
+
 
 @dataclass(frozen=True)
 class SendTarget:
@@ -119,9 +131,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.effective_message.reply_text("No estas autorizado para usar este bot.")
         return
 
-    await update.effective_message.reply_text(
-        "Enviame un enlace publico de video o imagenes y te lo devolvere listo para compartir."
-    )
+    await update.effective_message.reply_text(HELP_TEXT)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message:
+        await message.reply_text(HELP_TEXT)
 
 
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
